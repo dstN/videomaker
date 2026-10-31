@@ -93,6 +93,16 @@ def test_backoff_delay_is_capped(db):
     assert next_attempt - before <= pipeline_tasks._PREPARE_RETRY_MAX_DELAY + 1
 
 
+def test_poller_gives_up_after_max_attempts(db):
+    pipeline_tasks._prepare_failures.clear()
+    tr = _story_with_translation(db)
+    key = pipeline_tasks._story_key(tr.story_id, "en")
+    # Last failure long past its retry time, but attempt limit reached
+    pipeline_tasks._prepare_failures[key] = (pipeline_tasks._PREPARE_MAX_ATTEMPTS, 0.0)
+
+    assert pipeline_tasks._in_prepare_backoff(key)
+
+
 def test_reset_interrupted_jobs_resumes_from_artefacts(db, tmp_dir):
     audio = tmp_dir / "part_001.wav"
     audio.write_bytes(b"RIFF")

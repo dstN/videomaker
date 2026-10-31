@@ -34,6 +34,7 @@ _POLL_INTERVAL = 3  # seconds between DB scans
 # failing — without it the poller would re-hit Gemini every _POLL_INTERVAL.
 _PREPARE_RETRY_BASE_DELAY = 60     # seconds after the first failure
 _PREPARE_RETRY_MAX_DELAY = 3600    # cap for the exponential backoff
+_PREPARE_MAX_ATTEMPTS = 5          # then the poller gives up until API restart
 _prepare_failures: dict[str, tuple[int, float]] = {}  # key -> (failures, next attempt monotonic)
 
 
@@ -52,7 +53,10 @@ def _resume_status(part: VideoPart) -> JobStatus:
 
 def _in_prepare_backoff(key: str) -> bool:
     entry = _prepare_failures.get(key)
-    return entry is not None and time.monotonic() < entry[1]
+    if entry is None:
+        return False
+    failures, next_attempt = entry
+    return failures >= _PREPARE_MAX_ATTEMPTS or time.monotonic() < next_attempt
 
 
 def _record_prepare_result(story_id: int, language_code: str) -> None:
@@ -80,6 +84,13 @@ def _record_prepare_result(story_id: int, language_code: str) -> None:
     failures = _prepare_failures.get(key, (0, 0.0))[0] + 1
     delay = min(_PREPARE_RETRY_BASE_DELAY * 2 ** (failures - 1), _PREPARE_RETRY_MAX_DELAY)
     _prepare_failures[key] = (failures, time.monotonic() + delay)
+    if failures >= _PREPARE_MAX_ATTEMPTS:
+        logger.error(
+            "Story %d/%s: no parts after %d attempts — poller gives up until restart. "
+            "Retry manually via POST /pipeline/run.",
+            story_id, language_code, failures,
+        )
+        return
     logger.warning(
         "Story %d/%s still has no parts after %d attempt(s) — next try in %ds.",
         story_id, language_code, failures, delay,
