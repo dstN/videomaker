@@ -17,8 +17,10 @@ class Settings(BaseSettings):
     # Service URLs
     api_base_url: str = "http://api:8000"
     whisperx_url: str = "http://whisperx:8600"
-    # Voxtral läuft auf dem WSL2-Host (GPU via Vulkan, funktioniert nicht in Docker).
-    # start_voxtral_host.sh startet den Service auf Port 8700.
+    # Voxtral läuft auf dem Windows-Host (GPU via Vulkan, funktioniert nicht in Docker).
+    # Start-VoxtralService.ps1 startet den Service auf Port 8700. Die Host-IP
+    # kann sich nach einem Neustart ändern → VOXTRAL_URL in .env setzen
+    # (Windows-IP aus WSL: `ip route show default | awk '{print $3}'`).
     voxtral_url: str = "http://172.29.176.1:8700"
 
     # Paths
@@ -30,6 +32,12 @@ class Settings(BaseSettings):
     # Voxtral GGUF model (downloaded to data volume, not assets)
     voxtral_repo_id: str = "TrevorJS/voxtral-tts-q4-gguf"
     voxtral_cache_dir: Path = Path("/data/models/voxtral")
+
+    # Voxtral TTS client
+    tts_euler_steps: int = 8          # 3=real-time, 4=balanced, 8=quality
+    tts_timeout_s: float = 400.0      # > voxtral_service SYNTHESIS_TIMEOUT (360 s)
+    tts_retry_attempts: int = 3
+    tts_retry_base_delay: float = 10.0
 
     # Video part length (words). 160-210 words ≈ 60-90 s of narration.
     part_min_words: int = 160

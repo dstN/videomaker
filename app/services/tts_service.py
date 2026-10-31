@@ -18,96 +18,96 @@ euler_steps=3: minimum for intelligible flow-matching TTS output.
 from __future__ import annotations
 
 import asyncio
-import audioop
 import io
 import logging
 import re
 import subprocess
+import time
 import wave
 from pathlib import Path
 
 import httpx
+from num2words import num2words
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ── Number-to-words normalisation ─────────────────────────────────────────────
-_ONES = [
-    "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
-    "seventeen", "eighteen", "nineteen",
-]
-_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+# Voxtral reads digits unreliably and WhisperX cannot align them, so numbers are
+# spelled out in the story's language before synthesis.
+
+_DECIMAL_WORD = {"en": "point", "de": "Komma", "fr": "virgule", "es": "coma"}
 
 
-def _int_to_words(n: int) -> str:
-    if n < 0:
-        return "minus " + _int_to_words(-n)
-    if n < 20:
-        return _ONES[n]
-    if n < 100:
-        return _TENS[n // 10] + ("-" + _ONES[n % 10] if n % 10 else "")
-    if n < 1000:
-        rest = n % 100
-        return _ONES[n // 100] + " hundred" + (" " + _int_to_words(rest) if rest else "")
-    if n < 1_000_000:
-        rest = n % 1000
-        return _int_to_words(n // 1000) + " thousand" + (" " + _int_to_words(rest) if rest else "")
-    rest = n % 1_000_000
-    return _int_to_words(n // 1_000_000) + " million" + (" " + _int_to_words(rest) if rest else "")
+def _n2w(n: int, lang: str, **kwargs) -> str:
+    try:
+        return num2words(n, lang=lang, **kwargs)
+    except NotImplementedError:
+        return num2words(n, lang="en", **kwargs)
 
 
-def _year_to_words(n: int) -> str:
-    """Convert a 4-digit year to natural spoken form: 1987 → 'nineteen eighty-seven'."""
-    century = n // 100
-    remainder = n % 100
-    if remainder == 0:
-        return _int_to_words(century) + " hundred"
-    return _int_to_words(century) + " " + _int_to_words(remainder)
+def _time_to_words(h: str, m: str, lang: str) -> str:
+    """'4:15' → 'four fifteen' (en) / 'vier Uhr fünfzehn' (de)."""
+    hour, minute = int(h), int(m)
+    if lang == "de":
+        return _n2w(hour, lang) + " Uhr" + (" " + _n2w(minute, lang) if minute else "")
+    hw = _n2w(hour, lang)
+    if minute == 0:
+        return hw + " o'clock"
+    if minute < 10:
+        return hw + " oh " + _n2w(minute, lang)
+    return hw + " " + _n2w(minute, lang)
 
 
-def _time_to_words(h: str, m: str) -> str:
-    """Convert '4:15' or '4.15' → 'four fifteen'."""
-    hw = _int_to_words(int(h))
-    mi = int(m)
-    return hw + (" oh " + _int_to_words(mi) if 0 < mi < 10 else (" " + _int_to_words(mi) if mi else " o'clock"))
+def _normalize_numbers(text: str, lang: str = "en") -> str:
+    """Replace digit-form numbers with spoken words in the given language."""
+    if lang == "de":
+        # 16:15, 16:15 Uhr, 16.15 Uhr
+        text = re.sub(
+            r"\b(\d{1,2}):(\d{2})(?:\s*Uhr)?\b|\b(\d{1,2})\.(\d{2})\s*Uhr\b",
+            lambda m: _time_to_words(m.group(1) or m.group(3), m.group(2) or m.group(4), lang),
+            text,
+        )
+        decimal_sep = ","
+    else:
+        # 4:15 PM / 4.15 pm
+        text = re.sub(
+            r"\b(\d{1,2})[:\.](\d{2})\s*(am|pm|AM|PM)\b",
+            lambda m: _time_to_words(m.group(1), m.group(2), lang) + " " + m.group(3).lower(),
+            text,
+        )
+        decimal_sep = "."
 
-
-def _normalize_numbers(text: str) -> str:
-    """Replace digit-form numbers with spoken-word equivalents so WhisperX can align them."""
-    # Time patterns like 4:15 PM or 4.15 pm (before plain decimal handling)
+    # Decimals: 3.5 (en) / 3,5 (de) → "three point five" / "drei Komma fünf"
+    point = _DECIMAL_WORD.get(lang, _DECIMAL_WORD["en"])
     text = re.sub(
-        r'\b(\d{1,2})[:\.](\d{2})\s*(am|pm|AM|PM)\b',
-        lambda m: _time_to_words(m.group(1), m.group(2)) + " " + m.group(3).lower(),
+        rf"\b(\d+){re.escape(decimal_sep)}(\d+)\b",
+        lambda m: _n2w(int(m.group(1)), lang) + f" {point} "
+        + " ".join(_n2w(int(d), lang) for d in m.group(2)),
         text,
     )
-    # Plain decimals like 3.5 → "three point five"
+    # Years: 4-digit numbers in plausible year range
     text = re.sub(
-        r'\b(\d+)\.(\d+)\b',
-        lambda m: _int_to_words(int(m.group(1))) + " point " + " ".join(_int_to_words(int(d)) for d in m.group(2)),
-        text,
-    )
-    # Years: 4-digit numbers in plausible year range → "nineteen eighty-seven"
-    text = re.sub(
-        r'\b(1[1-9]\d{2}|20[0-9]{2})\b',
-        lambda m: _year_to_words(int(m.group(1))),
+        r"\b(1[1-9]\d{2}|20[0-9]{2})\b",
+        lambda m: _n2w(int(m.group(1)), lang, to="year"),
         text,
     )
     # Plain integers
-    text = re.sub(
-        r'\b(\d+)\b',
-        lambda m: _int_to_words(int(m.group(1))),
-        text,
-    )
+    text = re.sub(r"\b(\d+)\b", lambda m: _n2w(int(m.group(1)), lang), text)
     return text
+
+
+def spoken_text(text: str, lang: str = "en") -> str:
+    """The exact text Voxtral is asked to speak (also used for subtitle alignment)."""
+    return _normalize_numbers(text, lang)
 
 # Output sample rate produced by voxtral (24 kHz PCM)
 SAMPLE_RATE = 24_000
 
-# euler_steps=8: quality mode (CLI: 3=real-time, 4=balanced, 8=quality).
-# Safe on 8 GB VRAM -- step count does NOT increase peak tensor size.
-DEFAULT_EULER_STEPS = 8
+# euler_steps (CLI: 3=real-time, 4=balanced, 8=quality) comes from
+# settings.tts_euler_steps. Safe on 8 GB VRAM -- step count does NOT increase
+# peak tensor size, but synthesis time grows linearly with it.
 
 # max_frames per synthesis call. 600 frames x 80 ms/frame = 48 s of audio.
 # 300 was stable; 600 is the next step up. If cubecl OOMs on your GPU,
@@ -216,25 +216,7 @@ def _split_into_chunks(text: str, target_chars: int = _CHUNK_TARGET_CHARS) -> li
     return chunks
 
 
-# -- WAV concatenation with RMS normalisation ---------------------------------
-
-_TARGET_RMS = 8000   # target RMS level (out of 32768 for 16-bit PCM)
-_MAX_GAIN   = 1.05   # almost no boosting — avoids amplifying TTS model noise floor
-_MIN_GAIN   = 0.6    # never cut more than 40 % (keeps loud chunks audible)
-
-
-def _rms(frames: bytes, sampwidth: int) -> float:
-    """Return RMS amplitude of raw PCM frames."""
-    rms = audioop.rms(frames, sampwidth)
-    return float(rms) if rms > 0 else 1.0
-
-
-def _normalize_frames(frames: bytes, sampwidth: int, target_rms: float = _TARGET_RMS) -> bytes:
-    """Scale PCM frames toward target_rms, clamped to [_MIN_GAIN, _MAX_GAIN]."""
-    current = _rms(frames, sampwidth)
-    factor = max(_MIN_GAIN, min(_MAX_GAIN, target_rms / current))
-    return audioop.mul(frames, sampwidth, factor)
-
+# -- WAV helpers ---------------------------------------------------------------
 
 def _silence_frames(framerate: int, sampwidth: int, channels: int, ms: int) -> bytes:
     """Generate ms milliseconds of digital silence."""
@@ -306,9 +288,9 @@ def _apply_tempo(wav_bytes: bytes, tempo: float) -> bytes:
 
 def _concat_wavs(wav_blobs: list[bytes]) -> bytes:
     """
-    Concatenate WAV blobs with:
-    - Soft RMS normalisation per chunk (gain clamped to avoid noise amplification)
-    - 300 ms silence padding between chunks for a natural sentence-boundary breath
+    Concatenate WAV blobs with 300 ms silence padding between chunks for a
+    natural sentence-boundary breath. Loudness is normalised afterwards by
+    _apply_loudnorm().
     """
     buf = io.BytesIO()
     with wave.open(buf, "wb") as out_wav:
@@ -365,6 +347,46 @@ def _synthesize_chunk(
     return wav_bytes
 
 
+def _is_retryable_tts_error(exc: Exception) -> bool:
+    """Timeouts and server-side errors are worth retrying; a dead service is not."""
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    return isinstance(exc, TTSError) and "HTTP 5" in str(exc)
+
+
+def _synthesize_with_retry(
+    client: httpx.Client,
+    url: str,
+    chunk: str,
+    voice: str,
+    euler_steps: int,
+    label: str,
+) -> bytes:
+    settings = get_settings()
+    attempts = max(1, settings.tts_retry_attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _synthesize_chunk(client, url, chunk, voice, euler_steps)
+        except httpx.ConnectError as exc:
+            raise TTSError(
+                f"Cannot connect to voxtral-engine at {settings.voxtral_url}. "
+                "Is the service running?"
+            ) from exc
+        except (httpx.TimeoutException, TTSError) as exc:
+            if attempt == attempts or not _is_retryable_tts_error(exc):
+                if isinstance(exc, httpx.TimeoutException):
+                    raise TTSError(
+                        f"voxtral-engine timed out after {settings.tts_timeout_s:.0f}s on {label} "
+                        f"({len(chunk)} chars, {attempts} attempt(s))"
+                    ) from exc
+                raise
+            delay = settings.tts_retry_base_delay * 2 ** (attempt - 1)
+            logger.warning("TTS %s failed (%s) — retry %d/%d in %.0fs",
+                           label, str(exc)[:120], attempt, attempts - 1, delay)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 # -- Internal blocking call ----------------------------------------------------
 
 def _generate_blocking(
@@ -374,7 +396,7 @@ def _generate_blocking(
     euler_steps: int,
 ) -> None:
     """
-    Split text into <=24-second chunks, synthesize each via the voxtral service,
+    Split text into short chunks, synthesize each via the voxtral service,
     concatenate the WAV chunks, and write the result to output_path.
     Must be called from a thread pool -- httpx is used in sync mode here.
     """
@@ -388,22 +410,13 @@ def _generate_blocking(
     )
 
     wav_blobs: list[bytes] = []
-    try:
-        with httpx.Client(timeout=600.0) as client:
-            for idx, chunk in enumerate(chunks, 1):
-                logger.info("  chunk %d/%d: %d chars", idx, len(chunks), len(chunk))
-                wav_blobs.append(
-                    _synthesize_chunk(client, url, chunk, voice, euler_steps)
-                )
-    except httpx.ConnectError as exc:
-        raise TTSError(
-            f"Cannot connect to voxtral-engine at {settings.voxtral_url}. "
-            "Is the service running?"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise TTSError(
-            f"voxtral-engine timed out after 360s for chunk of {len(text)} chars"
-        ) from exc
+    with httpx.Client(timeout=settings.tts_timeout_s) as client:
+        for idx, chunk in enumerate(chunks, 1):
+            label = f"chunk {idx}/{len(chunks)}"
+            logger.info("  %s: %d chars", label, len(chunk))
+            wav_blobs.append(
+                _synthesize_with_retry(client, url, chunk, voice, euler_steps, label)
+            )
 
     final_wav = _concat_wavs(wav_blobs) if len(wav_blobs) > 1 else wav_blobs[0]
     final_wav = _apply_tempo(final_wav, _SPEECH_TEMPO)
@@ -431,7 +444,7 @@ async def generate_audio(
     Args:
         text:        Text to synthesize.
         output_path: Destination .wav path (parent dirs created automatically).
-        lang_code:   ISO 639-1 language code (informational only).
+        lang_code:   ISO 639-1 language code (used to spell out numbers).
         voice:       Voice preset to use. Defaults to _DEFAULT_VOICE.
 
     Returns:
@@ -441,10 +454,10 @@ async def generate_audio(
         TTSError: If synthesis or HTTP communication fails.
     """
     voice = voice if voice in AVAILABLE_VOICES else _DEFAULT_VOICE
-    text = _normalize_numbers(text)
+    text = spoken_text(text, lang_code)
     logger.info("Generating audio | lang=%s -> voice=%s | %d chars", lang_code, voice, len(text))
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(
             None,
@@ -452,7 +465,7 @@ async def generate_audio(
             text,
             output_path,
             voice,
-            DEFAULT_EULER_STEPS,
+            get_settings().tts_euler_steps,
         )
     except TTSError:
         raise

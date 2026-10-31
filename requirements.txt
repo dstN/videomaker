@@ -9,6 +9,7 @@ moviepy>=2.0.0
 Pillow>=10.3.0
 aiofiles>=23.2.1
 python-multipart>=0.0.9
+num2words>=0.5.13
 
 # Asset auto-download
 huggingface_hub>=0.24.0
