@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     voxtral_repo_id: str = "TrevorJS/voxtral-tts-q4-gguf"
     voxtral_cache_dir: Path = Path("/data/models/voxtral")
 
+    # Video part length (words). 160-210 words ≈ 60-90 s of narration.
+    part_min_words: int = 160
+    part_max_words: int = 210
+
     # Rendering
     ffmpeg_preset: str = "fast"
     video_codec: str = "h264_nvenc"

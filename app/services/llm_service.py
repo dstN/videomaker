@@ -7,19 +7,26 @@ Architecture:
   - No server-side CachedContent (not available on Free Tier)
   - Each generation call passes [pdf_file, task_prompt] directly in contents
   - system_instruction sent per-call via GenerateContentConfig
+  - Structured output via response_schema — no hand-rolled JSON repair
   - Falls back gracefully to a plain model if the PDF is not on disk
+
+Splitting never lets the model rewrite text: the story is cut into numbered
+sentences locally, Gemini only picks the sentence where each part ends, and
+the snippets are sliced from the original string. If the model's plan is
+unusable, a deterministic local splitter takes over.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
+import re
 import time
-from typing import Any
+from typing import Any, TypeVar
 
 from google import genai
 from google.genai import types
+from pydantic import BaseModel
 
 from app.config import get_settings
 
@@ -69,17 +76,23 @@ _pdf_file: Any = None
 _pdf_upload_time: float = 0.0
 _PDF_UPLOAD_TTL = 47 * 3600
 
-# Temperature for creative story generation (high enough for variety, low enough
-# that JSON structure stays valid).
+# Temperature for creative story generation (high for variety; the response
+# schema keeps the JSON structure valid).
 _CREATIVE_TEMPERATURE = 1.4
+# Splitting is an analytical task — deterministic output is what we want.
+_SPLIT_TEMPERATURE = 0.0
+
+# Target length for freshly generated stories (words).
+_STORY_LENGTH_HINT = "1200 to 2000 words"
 
 # ── Story seed injection ──────────────────────────────────────────────────────
 # Random anchors injected per-call so every generation has a different starting
 # point, preventing the model from falling into the same statistical grooves.
+# No night-time 2-4 AM entries: the system instruction forbids witching-hour times.
 
 _SEED_TIMES = [
     "6:14 AM", "11:38 PM", "4:52 PM", "8:07 AM", "1:23 PM", "9:41 PM",
-    "2:55 AM", "7:30 PM", "10:18 AM", "5:03 PM", "12:47 PM", "3:29 AM",
+    "7:30 PM", "10:18 AM", "5:03 PM", "12:47 PM", "5:56 AM", "10:02 PM",
 ]
 _SEED_OCCUPATIONS = [
     "a night-shift warehouse supervisor", "a retired school librarian",
@@ -108,6 +121,28 @@ def _make_story_seed() -> str:
         f"  • Primary setting: {loc}\n"
         f"  • First specific time mentioned in the story: {t}\n"
     )
+
+
+# ── Response schemas ──────────────────────────────────────────────────────────
+
+class _StoryDraft(BaseModel):
+    story_title: str
+    text: str
+
+
+class _SplitBoundary(BaseModel):
+    end_sentence: int
+    cliffhanger_note: str
+
+
+class _SplitPlan(BaseModel):
+    story_title: str
+    parts: list[_SplitBoundary]
+
+
+class _Rewrite(BaseModel):
+    title: str
+    text: str
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -179,12 +214,16 @@ def _get_pdf_file(client: genai.Client) -> Any | None:
 def _resolve_model() -> tuple[genai.Client, str, list[str], Any | None]:
     """
     Returns (client, model_name, [fallback_models], pdf_file_or_None).
+    Blocking (File API network calls) — run it in an executor from async code.
     """
     client = _get_client()
     settings = get_settings()
 
-    # Fallback chain: Primary -> Flash -> Gemma 4
-    fallbacks = ["gemini-2.5-flash", "gemma-4-31b-it"]
+    # Fallback chain: Primary -> Flash -> configured fallback (Gemma 4 by default)
+    fallbacks: list[str] = []
+    for name in ("gemini-2.5-flash", settings.gemini_fallback_model):
+        if name and name != settings.gemini_model and name not in fallbacks:
+            fallbacks.append(name)
 
     pdf_file = _get_pdf_file(client)
     if pdf_file is None:
@@ -192,13 +231,20 @@ def _resolve_model() -> tuple[genai.Client, str, list[str], Any | None]:
     return client, settings.gemini_model, fallbacks, pdf_file
 
 
-def _is_rate_limited(exc: Exception) -> bool:
-    """Return True if the exception is a 429 / RESOURCE_EXHAUSTED rate-limit error."""
+async def _resolve_model_async() -> tuple[genai.Client, str, list[str], Any | None]:
+    return await asyncio.get_running_loop().run_in_executor(None, _resolve_model)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for rate limits (429) and transient server errors (500/502/503/504)."""
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if code == 429:
+    if code in (429, 500, 502, 503, 504):
         return True
     msg = str(exc).upper()
-    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "QUOTA_EXCEEDED" in msg
+    return any(
+        marker in msg
+        for marker in ("429", "RESOURCE_EXHAUSTED", "QUOTA_EXCEEDED", "UNAVAILABLE", "OVERLOADED", "503")
+    )
 
 
 async def _generate_with_fallback(
@@ -209,76 +255,268 @@ async def _generate_with_fallback(
     config: types.GenerateContentConfig,
 ) -> Any:
     """
-    Call generate_content with a chain of fallbacks on 429 errors.
+    Call generate_content with a chain of fallbacks on rate-limit / transient errors.
     """
     models_to_try = [primary_model] + fallback_models
-    
+
     for i, model_name in enumerate(models_to_try):
         try:
-            # Gemma/Local models often don't support multimodal File API inputs
             current_contents = contents
+            current_config = config
             if "gemma" in model_name.lower():
+                # Gemma doesn't take File API inputs or a response schema
                 text_only = [c for c in contents if isinstance(c, str)]
                 current_contents = text_only if text_only else contents
+                current_config = config.model_copy(update={"response_schema": None})
 
             return await client.aio.models.generate_content(
                 model=model_name,
                 contents=current_contents,
-                config=config,
+                config=current_config,
             )
         except Exception as exc:
-            if not _is_rate_limited(exc) or i == len(models_to_try) - 1:
+            if not _is_retryable(exc) or i == len(models_to_try) - 1:
                 raise
-            
+
             logger.warning(
-                "Model %s rate-limited (429) — retrying with next fallback %s",
+                "Model %s failed (%s) — retrying with next fallback %s",
                 model_name,
-                models_to_try[i+1],
+                str(exc)[:120],
+                models_to_try[i + 1],
             )
 
 
-def _parse_json_parts(raw: str) -> list[dict]:
-    """Parse and validate Gemini JSON output, stripping markdown fences if present."""
+def _strip_fences(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:])
         raw = raw.rsplit("```", 1)[0]
-    raw = raw.strip()
+    return raw.strip()
 
-    try:
-        parts: list[dict] = json.loads(raw)
-    except json.JSONDecodeError as e:
-        if "Extra data" in str(e):
-            # The LLM appended garbage text after a valid JSON array.
-            # e.pos is the index where the valid JSON ends and the garbage begins.
-            valid_json = raw[:e.pos].strip()
-            try:
-                parts: list[dict] = json.loads(valid_json)
-                logger.warning("Recovered from JSON 'Extra data' error by stripping trailing text.")
-            except Exception:
-                logger.error(f"Failed to parse JSON. Raw content was:\n{raw}\n---")
-                raise e
-        else:
-            logger.error(f"Failed to parse JSON. Raw content was:\n{raw}\n---")
-            raise e
 
-    required_keys = {"part_number", "text_snippet", "cliffhanger_note"}
-    for p in parts:
-        missing = required_keys - set(p.keys())
-        if missing:
-            raise ValueError(f"LLM returned part missing keys {missing}: {p}")
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
+
+def _parse_model(response: Any, model_cls: type[_ModelT]) -> _ModelT:
+    """Use the SDK's parsed object when present, else validate the raw text."""
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, model_cls):
+        return parsed
+    return model_cls.model_validate_json(_strip_fences(response.text))
+
+
+# ── Sentence segmentation & local splitting ──────────────────────────────────
+
+# A sentence ends after terminal punctuation (plus closing quotes/brackets)
+# followed by whitespace, or at a line break.
+_SENTENCE_BOUNDARY = re.compile(r"[.!?…]+[\"”’'\)\]]*(?=\s)|\n")
+
+
+def split_sentences(text: str) -> list[tuple[int, int]]:
+    """
+    Return (start, end) character spans of the sentences in text.
+    Spans cover every non-whitespace character exactly once, in order.
+    """
+    spans: list[tuple[int, int]] = []
+
+    def _add(start: int, end: int) -> None:
+        chunk = text[start:end]
+        stripped = chunk.strip()
+        if stripped:
+            offset = start + (len(chunk) - len(chunk.lstrip()))
+            spans.append((offset, offset + len(stripped)))
+
+    start = 0
+    for m in _SENTENCE_BOUNDARY.finditer(text):
+        _add(start, m.end())
+        start = m.end()
+    _add(start, len(text))
+    return spans
+
+
+def plan_parts_locally(word_counts: list[int], min_words: int, max_words: int) -> list[int]:
+    """
+    Choose part boundaries (exclusive end sentence indices) so each part lands
+    inside [min_words, max_words] and as close to the midpoint as possible.
+    Dynamic programming over sentence boundaries; a single sentence longer
+    than max_words becomes its own part.
+    """
+    n = len(word_counts)
+    if n == 0:
+        return []
+    prefix = [0]
+    for wc in word_counts:
+        prefix.append(prefix[-1] + wc)
+    if prefix[-1] <= max_words:
+        return [n]
+
+    target = (min_words + max_words) / 2
+
+    def cost(words: int) -> float:
+        if min_words <= words <= max_words:
+            return (words - target) ** 2
+        outside = min_words - words if words < min_words else words - max_words
+        return 1e6 + (outside ** 2) * 100
+
+    best = [float("inf")] * (n + 1)
+    prev = [0] * (n + 1)
+    best[0] = 0.0
+    for j in range(1, n + 1):
+        for i in range(j - 1, -1, -1):
+            words = prefix[j] - prefix[i]
+            if words > 2 * max_words and j - i > 1:
+                break
+            c = best[i] + cost(words)
+            if c < best[j]:
+                best[j] = c
+                prev[j] = i
+
+    ends: list[int] = []
+    j = n
+    while j > 0:
+        ends.append(j)
+        j = prev[j]
+    return list(reversed(ends))
+
+
+def _plan_is_usable(
+    ends: list[int], word_counts: list[int], min_words: int, max_words: int
+) -> bool:
+    """Validate an LLM split plan: contiguous, complete, word counts in range."""
+    n = len(word_counts)
+    if not ends or ends[-1] != n or any(b <= a for a, b in zip([0] + ends, ends)):
+        return False
+    lo, hi = int(min_words * 0.85), int(max_words * 1.15)
+    start = 0
+    for idx, end in enumerate(ends):
+        words = sum(word_counts[start:end])
+        is_last = idx == len(ends) - 1
+        if words > hi or (words < lo and not (is_last and words >= min_words * 0.5)):
+            return False
+        start = end
+    return True
+
+
+def _build_parts(
+    text: str,
+    spans: list[tuple[int, int]],
+    ends: list[int],
+    notes: list[str],
+) -> list[dict]:
+    parts: list[dict] = []
+    start = 0
+    for idx, end in enumerate(ends):
+        snippet = text[spans[start][0]:spans[end - 1][1]]
+        parts.append({
+            "part_number": idx + 1,
+            "text_snippet": snippet,
+            "word_count": len(snippet.split()),
+            "cliffhanger_note": notes[idx] if idx < len(notes) else "",
+        })
+        start = end
     return parts
 
 
-def _extract_title(parts: list[dict]) -> str | None:
-    """Pull the story title from the first part if Gemini included it."""
-    if parts:
-        return parts[0].get("story_title") or None
-    return None
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
+
+async def split_into_parts(
+    text: str,
+    lang: str = "en",
+    open_ending: bool = False,
+) -> tuple[str | None, list[dict]]:
+    """
+    Split story text into video parts of PART_MIN_WORDS..PART_MAX_WORDS words.
+    Snippets are sliced verbatim from the input — the model only chooses cut points.
+
+    open_ending=True  → last part's note describes the unresolved cliffhanger.
+    open_ending=False → last part's note is 'RESOLUTION'.
+
+    Returns:
+        (story_title, parts) where parts is a list of
+        [{part_number, text_snippet, word_count, cliffhanger_note}]
+    """
+    settings = get_settings()
+    min_w, max_w = settings.part_min_words, settings.part_max_words
+
+    spans = split_sentences(text)
+    if not spans:
+        raise ValueError("Cannot split empty story text.")
+    sentences = [text[s:e] for s, e in spans]
+    word_counts = [len(s.split()) for s in sentences]
+    n = len(sentences)
+
+    last_note_rule = (
+        "≤15 words describing the unresolved dread (NOT 'RESOLUTION')"
+        if open_ending else
+        "write 'RESOLUTION'"
+    )
+    numbered = "\n".join(
+        f"[{i}] ({wc}w) {s.replace(chr(10), ' ')}"
+        for i, (s, wc) in enumerate(zip(sentences, word_counts), 1)
+    )
+    task_prompt = (
+        f"TASK: The story below ({lang.upper()}) is given as {n} numbered sentences, "
+        "each with its word count. Decide where each short-video part ends.\n\n"
+        "RULES:\n"
+        f"- Each part must contain {min_w} to {max_w} words in total (sum the word counts).\n"
+        "- Every part except the last must end on a sentence that leaves the viewer in suspense.\n"
+        "- Parts are contiguous. For each part return end_sentence = the number of its LAST sentence.\n"
+        f"- end_sentence values strictly increase; the final part MUST end at sentence {n}.\n"
+        "- cliffhanger_note: ≤15 words on the tension at the cut; "
+        f"for the last part {last_note_rule}.\n"
+        "- story_title: a short evocative title (≤6 words) for the full story.\n\n"
+        f"SENTENCES:\n{numbered}"
+    )
+
+    title: str | None = None
+    ends: list[int] = []
+    notes: list[str] = []
+    try:
+        client, model_name, fallback_models, _ = await _resolve_model_async()
+        gen_config = types.GenerateContentConfig(
+            system_instruction=_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=_SplitPlan,
+            temperature=_SPLIT_TEMPERATURE,
+        )
+        response = await _generate_with_fallback(
+            client, model_name, fallback_models, [task_prompt], gen_config
+        )
+        plan = _parse_model(response, _SplitPlan)
+        title = plan.story_title.strip() or None
+        ends = [b.end_sentence for b in plan.parts]
+        notes = [b.cliffhanger_note for b in plan.parts]
+    except Exception as exc:
+        logger.warning("LLM split plan failed (%s) — using local splitter.", str(exc)[:200])
+
+    if not _plan_is_usable(ends, word_counts, min_w, max_w):
+        if ends:
+            logger.warning(
+                "LLM split plan rejected (ends=%s, %d sentences) — using local splitter.",
+                ends, n,
+            )
+        ends = plan_parts_locally(word_counts, min_w, max_w)
+        notes = []
+        if not open_ending:
+            notes = [""] * (len(ends) - 1) + ["RESOLUTION"]
+
+    return title, _build_parts(text, spans, ends, notes)
+
+
+async def _generate_story_text(task_prompt: str) -> tuple[str, str]:
+    """Run a creative generation prompt and return (title, full story text)."""
+    client, model_name, fallback_models, pdf_file = await _resolve_model_async()
+    contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
+    gen_config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=_StoryDraft,
+        temperature=_CREATIVE_TEMPERATURE,
+    )
+    response = await _generate_with_fallback(client, model_name, fallback_models, contents, gen_config)
+    draft = _parse_model(response, _StoryDraft)
+    return draft.story_title.strip(), draft.text.strip()
+
 
 async def generate_and_split(
     prompt: str,
@@ -287,124 +525,43 @@ async def generate_and_split(
 ) -> tuple[str | None, list[dict]]:
     """
     Generate a new r/nosleep style story from a user prompt, then split it
-    into video parts of 220-290 words each.
+    into video parts (see split_into_parts).
 
-    open_ending=True  → last part ends on a cliffhanger (teases a sequel).
-    open_ending=False → last part resolves the central threat (default).
+    open_ending=True  → the story ends on a cliffhanger (teases a sequel).
+    open_ending=False → the story resolves the central threat (default).
 
     Returns:
         (story_title, parts) where parts is a list of
         [{part_number, text_snippet, word_count, cliffhanger_note}]
     """
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, pdf_file = await loop.run_in_executor(None, _resolve_model)
-
     if open_ending:
         ending_rule = (
             "- The story does NOT need to resolve — it must end on a HARD, irresistible cliffhanger.\n"
             "  The final scene should cut off at the worst possible moment. Leave the central threat\n"
-            "  unanswered. The viewer MUST feel compelled to watch Part 2.\n"
-            "- cliffhanger_note for the last part: ≤15 words describing the unresolved dread\n"
-            "  (do NOT write 'RESOLUTION' — write the actual cliffhanger tension)."
+            "  unanswered. The viewer MUST feel compelled to watch the next story."
         )
     else:
         ending_rule = (
             "- The story MUST be complete with a real, concrete ending.\n"
-            "- The final part must resolve the central threat or mystery — not leave it dangling.\n"
-            "  'I heard her voice' or 'I still don't know what it was' are NOT endings. Go further.\n"
-            "- cliffhanger_note: write 'RESOLUTION' for the last part."
+            "- The final scene must resolve the central threat or mystery — not leave it dangling.\n"
+            "  'I heard her voice' or 'I still don't know what it was' are NOT endings. Go further."
         )
 
     task_prompt = (
         f"TASK: Write an original Reddit r/nosleep horror story in {lang.upper()} "
         f"based on this premise:\n\n\"{prompt}\"\n\n"
         f"{_make_story_seed()}\n\n"
-        "Then immediately split the full story into sequential video parts.\n\n"
-        f"STORY REQUIREMENTS:\n{ending_rule}\n\n"
-        "SPLITTING RULES:\n"
-        "- Each part: exactly 230 to 450 words (strictly enforced for 90-180s TTS audio)\n"
-        "- All parts EXCEPT the last MUST end mid-tension on a genuine cliffhanger\n"
-        "- Parts must be contiguous — no overlap, no gaps, no paraphrasing\n"
-        "- part_number starts at 1\n"
-        "- word_count is the exact word count of text_snippet\n"
-        "- story_title: ONLY on part_number=1, a short evocative title (≤6 words) for the full story\n\n"
-        "Return ONLY a JSON array — no prose, no markdown fences:\n"
-        '[{"part_number": 1, "story_title": "The Title", "text_snippet": "...", "word_count": 250, "cliffhanger_note": "..."}, ...]'
+        f"STORY REQUIREMENTS:\n{ending_rule}\n"
+        f"- Length: {_STORY_LENGTH_HINT}.\n"
+        "- The story will be cut into ~60-90 second video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 150-200 words.\n"
+        "- story_title: a short evocative title (≤6 words).\n\n"
+        "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
 
-    contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
-
-    gen_config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        temperature=_CREATIVE_TEMPERATURE,
-    )
-
-    response = await _generate_with_fallback(client, model_name, fallback_models, contents, gen_config)
-    parts = _parse_json_parts(response.text)
-    title = _extract_title(parts)
-    return title, parts
-
-
-async def split_into_parts(
-    text: str,
-    lang: str = "en",
-    open_ending: bool = False,
-) -> tuple[str | None, list[dict]]:
-    """
-    Split existing story text into 220-290 word video parts.
-    Snippets are verbatim from the input — no rewriting.
-
-    open_ending=True  → last part ends on a cliffhanger.
-    open_ending=False → last part resolves the central threat (default).
-
-    Returns:
-        (story_title, parts) where parts is a list of
-        [{part_number, text_snippet, word_count, cliffhanger_note}]
-    """
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, pdf_file = await loop.run_in_executor(None, _resolve_model)
-
-    if open_ending:
-        last_part_rule = (
-            "- The LAST part MUST end on a HARD cliffhanger — cut off at maximum tension.\n"
-            "  Do NOT resolve the central threat. The viewer must feel compelled to watch Part 2.\n"
-            "- cliffhanger_note for the last part: ≤15 words of the unresolved dread (NOT 'RESOLUTION')."
-        )
-    else:
-        last_part_rule = (
-            "- The LAST part MUST end with a concrete resolution of the central threat or mystery.\n"
-            "  'I heard her voice' or 'I still don't know' are NOT resolutions — go further.\n"
-            "- cliffhanger_note: write 'RESOLUTION' for the last part."
-        )
-
-    task_prompt = (
-        f"TASK: Split the following story text ({lang.upper()}) into sequential video parts.\n\n"
-        "SPLITTING RULES:\n"
-        "- Each part: 200 to 400 words (CRITICAL: NEVER exceed 400 words to stay under the 3-minute video limit)\n"
-        "- All parts EXCEPT the last MUST end on a suspenseful cliffhanger\n"
-        f"{last_part_rule}\n"
-        "- text_snippet must be verbatim from the original — no edits, no paraphrasing\n"
-        "- word_count is the exact word count of text_snippet\n"
-        "- part_number starts at 1\n"
-        "- story_title: ONLY on part_number=1, a short evocative title (≤6 words) for the full story\n\n"
-        f"STORY TEXT:\n{text}\n\n"
-        "Return ONLY a JSON array — no prose, no markdown:\n"
-        '[{"part_number": 1, "story_title": "The Title", "text_snippet": "...", "word_count": 250, "cliffhanger_note": "..."}]'
-    )
-
-    contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
-
-    gen_config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        temperature=_CREATIVE_TEMPERATURE,
-    )
-
-    response = await _generate_with_fallback(client, model_name, fallback_models, contents, gen_config)
-    parts = _parse_json_parts(response.text)
-    title = _extract_title(parts)
-    return title, parts
+    title, text = await _generate_story_text(task_prompt)
+    split_title, parts = await split_into_parts(text, lang, open_ending=open_ending)
+    return title or split_title, parts
 
 
 async def generate_description(title: str, full_text: str, lang: str = "en") -> str:
@@ -412,8 +569,7 @@ async def generate_description(title: str, full_text: str, lang: str = "en") -> 
     Generate a YouTube/TikTok-style video description + 5 hashtags for a story.
     #nosleep is always included.  Returns a ready-to-paste plain-text string.
     """
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, _ = await loop.run_in_executor(None, _resolve_model)
+    client, model_name, fallback_models, _ = await _resolve_model_async()
 
     lang_note = f" Write the description in {lang.upper()}." if lang != "en" else ""
 
@@ -450,7 +606,7 @@ _FOLLOWUP_MODE_PROMPTS: dict[str, str] = {
         "- Continue the same narrator, setting, and unresolved threads.\n"
         "- Open with 1-2 sentences of light re-grounding ('A week after the incident…').\n"
         "- Escalate the threat. {ending_instruction}\n"
-        "- story_title hint: short evocative sequel title (≤8 words, e.g. 'The Signal — Part 2')."
+        "- story_title: short evocative sequel title (≤8 words, e.g. 'The Signal — Part 2')."
     ),
     "prequel": (
         "TASK: Write a PREQUEL to the r/nosleep story below, in {lang}.\n\n"
@@ -460,7 +616,7 @@ _FOLLOWUP_MODE_PROMPTS: dict[str, str] = {
         "- Set the events BEFORE the child story. Explain the origin of the threat or mystery.\n"
         "- The narrator may be the same person at an earlier time, or a different witness.\n"
         "- {ending_instruction}\n"
-        "- story_title hint: prequel title (≤8 words, e.g. 'Before the Signal')."
+        "- story_title: prequel title (≤8 words, e.g. 'Before the Signal')."
     ),
     "expansion": (
         "TASK: Write an EXPANSION of the r/nosleep story below, in {lang}.\n\n"
@@ -470,14 +626,14 @@ _FOLLOWUP_MODE_PROMPTS: dict[str, str] = {
         "- Add depth through new scenes, extended moments, or a secondary character's POV.\n"
         "- Do NOT retell the original — add what was left off-screen or implied.\n"
         "- {ending_instruction}\n"
-        "- story_title hint: companion title (≤8 words, e.g. 'The Signal — Untold')."
+        "- story_title: companion title (≤8 words, e.g. 'The Signal — Untold')."
     ),
 }
 
 _ENDING_INSTRUCTIONS: dict[str, dict[bool, str]] = {
     "sequel": {
         False: "End with a concrete resolution — the horror pays off.",
-        True:  "Do NOT resolve the threat — end the last part on a hard cliffhanger that demands another sequel. Leave the horror undefeated and the narrator's fate uncertain.",
+        True:  "Do NOT resolve the threat — end on a hard cliffhanger that demands another sequel. Leave the horror undefeated and the narrator's fate uncertain.",
     },
     "prequel": {
         False: "The final scene must connect naturally to the opening of the child story.",
@@ -511,9 +667,6 @@ async def generate_followup(
     if mode not in _FOLLOWUP_MODE_PROMPTS:
         raise ValueError(f"Unknown followup mode: {mode!r}. Choose from {list(_FOLLOWUP_MODE_PROMPTS)}.")
 
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, pdf_file = await loop.run_in_executor(None, _resolve_model)
-
     mode_block = _FOLLOWUP_MODE_PROMPTS[mode].format(
         lang=lang.upper(),
         title=parent_title,
@@ -524,51 +677,26 @@ async def generate_followup(
     task_prompt = (
         f"{mode_block}\n\n"
         f"{_make_story_seed()}\n\n"
-        "SPLITTING RULES:\n"
-        "- Each part: exactly 230 to 450 words (strictly enforced for 90-180s TTS audio)\n"
-        "- All parts EXCEPT the last MUST end mid-tension on a genuine cliffhanger\n"
-        + (
-            "- The LAST part MUST end on a hard unresolved cliffhanger — NO resolution, tease a sequel\n"
-            if open_ending else
-            "- The LAST part MUST end with a concrete resolution — the horror pays off\n"
-        )
-        + "- cliffhanger_note: \u226415 words on the tension (write 'RESOLUTION' for the last part if resolved)\n"
-        "- Parts must be contiguous — no overlap, no gaps, no paraphrasing\n"
-        "- part_number starts at 1\n"
-        "- word_count is the exact word count of text_snippet\n"
-        "- story_title: ONLY on part_number=1\n\n"
-        "Return ONLY a JSON array — no prose, no markdown fences:\n"
-        '[{"part_number": 1, "story_title": "...", "text_snippet": "...", "word_count": 250, "cliffhanger_note": "..."}, ...]'
+        f"- Length: {_STORY_LENGTH_HINT}.\n"
+        "- The story will be cut into ~60-90 second video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 150-200 words.\n\n"
+        "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
 
-    contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
-
-    gen_config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        temperature=_CREATIVE_TEMPERATURE,
-    )
-
-    response = await _generate_with_fallback(client, model_name, fallback_models, contents, gen_config)
-    parts = _parse_json_parts(response.text)
-    title = _extract_title(parts)
-    return title, parts
+    title, text = await _generate_story_text(task_prompt)
+    split_title, parts = await split_into_parts(text, lang, open_ending=open_ending)
+    return title or split_title, parts
 
 
-async def translate_text(text: str, target_lang: str) -> str:
+async def translate_text(text: str, target_lang: str, source_lang: str = "en") -> str:
     """Translate text to target_lang using a plain (uncached) model call."""
-    if target_lang == "en":
+    if target_lang == source_lang:
         return text
 
-    client = _get_client()
-    settings = get_settings()
-    primary = settings.gemini_model
-    
-    # Use standard resolve logic for consistency
-    _, _, fallbacks, _ = _resolve_model()
+    client, primary, fallbacks, _ = await _resolve_model_async()
 
     prompt = (
-        f"Translate the following story text to {target_lang}. "
+        f"Translate the following story text from {source_lang} to {target_lang}. "
         "Preserve all paragraph breaks, punctuation, and narrative tone exactly. "
         "Return ONLY the translated text — no explanations, no commentary.\n\n"
         f"{text}"
@@ -585,8 +713,7 @@ async def rewrite_story(title: str, text: str) -> tuple[str, str]:
     Rewrite a scraped Reddit story to bypass copyright/duplication checks and add flavor.
     Changes dates, names, locations, and wording while keeping the narrative identical.
     """
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, pdf_file = await loop.run_in_executor(None, _resolve_model)
+    client, model_name, fallback_models, pdf_file = await _resolve_model_async()
 
     task_prompt = (
         f"TASK: Rewrite the following horror story slightly to make it unique.\n\n"
@@ -594,11 +721,9 @@ async def rewrite_story(title: str, text: str) -> tuple[str, str]:
         "- Change specific details: names of people, towns, dates, and minor objects.\n"
         "- Rephrase descriptions and dialogue, but DO NOT SUMMARIZE. You MUST keep the exact same plot, pacing, and emotional beats.\n"
         "- CRITICAL: The rewritten story MUST be at least as long as the original text. Do NOT cut out any scenes, dialogue, or inner monologues. Rewrite it paragraph by paragraph.\n"
-        "- Return ONLY a JSON object with 'title' (a new title) and 'text' (the rewritten story text).\n"
-        "- Do NOT include any markdown, just raw JSON.\n\n"
+        "- Return 'title' (a new title) and 'text' (the rewritten story text).\n\n"
         f"ORIGINAL TITLE: {title}\n"
-        f"ORIGINAL TEXT:\n{text}\n\n"
-        'Return format:\n{"title": "New Title", "text": "New story text..."}'
+        f"ORIGINAL TEXT:\n{text}"
     )
 
     contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
@@ -606,42 +731,13 @@ async def rewrite_story(title: str, text: str) -> tuple[str, str]:
     gen_config = types.GenerateContentConfig(
         system_instruction=_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
+        response_schema=_Rewrite,
         temperature=_CREATIVE_TEMPERATURE,
     )
 
     response = await _generate_with_fallback(client, model_name, fallback_models, contents, gen_config)
-    
-    raw = response.text.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:])
-        raw = raw.rsplit("```", 1)[0]
-    raw = raw.strip()
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        if "Extra data" in str(e):
-            valid_json = raw[:e.pos].strip()
-            try:
-                data = json.loads(valid_json)
-                logger.warning("Recovered from JSON 'Extra data' error in rewrite_story by stripping trailing text.")
-            except Exception:
-                pass
-        
-        # If still not parsed or it's an unescaped quote error
-        if 'data' not in locals():
-            logger.warning("JSONDecodeError in rewrite_story. Attempting regex fallback for unescaped quotes.")
-            import re
-            title_match = re.search(r'"title"\s* : \s*"((?:[^"\\]|\\.)*?)"\s*,', raw)
-            text_match = re.search(r'"text"\s* : \s*"(.*)"\s*}', raw, re.DOTALL)
-            if title_match and text_match:
-                data = {"title": title_match.group(1), "text": text_match.group(1).replace('\n', '\\n')}
-                logger.info("Successfully recovered using regex fallback.")
-            else:
-                logger.error(f"Failed to parse JSON in rewrite_story. Raw content was:\n{raw}\n---")
-                raise e
-
-    return data["title"], data["text"]
+    data = _parse_model(response, _Rewrite)
+    return data.title, data.text
 
 
 async def generate_title_only(text: str) -> str:
@@ -649,8 +745,7 @@ async def generate_title_only(text: str) -> str:
     Generate a new title for a story without rewriting the text.
     Used for multi-part series to maintain text continuity while having a unique title.
     """
-    loop = asyncio.get_event_loop()
-    client, model_name, fallback_models, pdf_file = await loop.run_in_executor(None, _resolve_model)
+    client, model_name, fallback_models, pdf_file = await _resolve_model_async()
 
     task_prompt = (
         f"TASK: Generate a completely new, creative, and unsettling title for this horror story.\n\n"

@@ -362,7 +362,7 @@ async def prepare_story_parts(story_id: int, language_code: str) -> None:
         if not existing_parts:
             logger.info("Splitting translation %d into parts...", translation.id)
             title, raw_parts = await llm_service.split_into_parts(
-                translation.translated_text, language_code
+                translation.translated_text, language_code, open_ending=bool(story.open_ending)
             )
             if title and not story.title:
                 story.title = title
