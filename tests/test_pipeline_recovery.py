@@ -23,11 +23,26 @@ def _add_part(db, tr: Translation, status: JobStatus, **part_kwargs) -> RenderJo
 
 
 def test_orphaned_translation_is_not_enqueued(db):
-    # Translation + pending job whose story no longer exists (FK not enforced)
-    tr = Translation(story_id=999, language_code="en", translated_text="text")
-    db.add(tr)
-    db.commit()
-    _add_part(db, tr, JobStatus.pending)
+    # Translation + pending job whose story no longer exists — legacy rows
+    # written while SQLite did not enforce foreign keys.
+    from app.database import engine
+
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql(
+            "INSERT INTO translations (id, story_id, language_code, translated_text) "
+            "VALUES (1, 999, 'en', 'text')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO video_parts (id, translation_id, part_number, text_snippet) "
+            "VALUES (1, 1, 1, 's')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO render_jobs (video_part_id, status, updated_at) "
+            "VALUES (1, 'pending', CURRENT_TIMESTAMP)"
+        )
+        conn.commit()
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     assert pipeline_tasks._find_stories_with_pending_jobs() == []
 
@@ -167,3 +182,16 @@ def test_list_jobs_filters_and_counts(db):
     assert data["total"] == 2
     assert len(data["jobs"]) == 1
     assert data["jobs"][0]["status"] == "failed"
+
+
+def test_deleting_story_cascades_to_children(db):
+    from sqlalchemy import text
+
+    tr = _story_with_translation(db)
+    _add_part(db, tr, JobStatus.pending)
+
+    db.execute(text("DELETE FROM stories WHERE id = :id"), {"id": tr.story_id})
+    db.commit()
+
+    for table in ("translations", "video_parts", "render_jobs"):
+        assert db.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() == 0

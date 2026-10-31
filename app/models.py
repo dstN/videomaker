@@ -75,7 +75,9 @@ class Translation(Base):
     __table_args__ = (UniqueConstraint("story_id", "language_code", name="uq_story_lang"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    story_id: Mapped[int] = mapped_column(Integer, ForeignKey("stories.id"), nullable=False)
+    story_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("stories.id", ondelete="CASCADE"), nullable=False
+    )
     language_code: Mapped[str] = mapped_column(String(10), nullable=False)
     translated_text: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -90,7 +92,7 @@ class VideoPart(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     translation_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("translations.id"), nullable=False
+        Integer, ForeignKey("translations.id", ondelete="CASCADE"), nullable=False
     )
     part_number: Mapped[int] = mapped_column(Integer, nullable=False)
     text_snippet: Mapped[str] = mapped_column(Text, nullable=False)
@@ -109,7 +111,7 @@ class RenderJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     video_part_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("video_parts.id"), nullable=False
+        Integer, ForeignKey("video_parts.id", ondelete="CASCADE"), nullable=False
     )
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus), default=JobStatus.pending, nullable=False

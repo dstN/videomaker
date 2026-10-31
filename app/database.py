@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -18,12 +18,22 @@ class Base(DeclarativeBase):
 def _make_engine():
     settings = get_settings()
     # WSL2 / SQLite: use check_same_thread=False for FastAPI background tasks
-    connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-    return create_engine(
+    is_sqlite = settings.database_url.startswith("sqlite")
+    connect_args = {"check_same_thread": False} if is_sqlite else {}
+    eng = create_engine(
         settings.database_url,
         connect_args=connect_args,
         echo=False,
     )
+    if is_sqlite:
+        # SQLite ignores foreign keys unless enabled per connection — without
+        # this, deleting a story left orphaned translations/parts/jobs behind.
+        @event.listens_for(eng, "connect")
+        def _enable_foreign_keys(dbapi_conn, _record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+    return eng
 
 
 engine = _make_engine()
