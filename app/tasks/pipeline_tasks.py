@@ -498,7 +498,11 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
                 timestamps_path.parent.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    words = await whisperx_service.transcribe(audio_path, language_code)
+                    words = await whisperx_service.transcribe(
+                        audio_path,
+                        language_code,
+                        text=tts_service.spoken_text(part.text_snippet, language_code),
+                    )
                     timestamps_path.write_text(json.dumps(words), encoding="utf-8")
                     part.timestamps_path = str(timestamps_path)
                     db.commit()
@@ -523,7 +527,7 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
 
                 try:
                     # render_service.render_part is CPU/GPU-bound; run in thread pool
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     rendered_path = await loop.run_in_executor(
                         None,
                         render_service.render_part,
@@ -534,6 +538,7 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
                         Path(part.audio_path),
                         Path(part.timestamps_path),
                         output_path,
+                        language_code,
                     )
                     _set_job_status(
                         db,

@@ -14,19 +14,22 @@ class WhisperXError(Exception):
     """Raised when the whisperX microservice returns an error."""
 
 
-async def transcribe(audio_path: Path, language: str = "en") -> list[dict]:
+async def transcribe(audio_path: Path, language: str = "en", text: str | None = None) -> list[dict]:
     """
     POST audio path to the whisperX microservice and return word-level timestamps.
+    With text (the exact spoken script) the service force-aligns instead of
+    transcribing, so subtitles match the script.
     Returns: [{"word": str, "start": float, "end": float}, ...]
     """
     settings = get_settings()
     url = f"{settings.whisperx_url}/transcribe"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    # Generous timeout: the first request per language also loads the align model.
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
             response = await client.post(
                 url,
-                json={"audio_path": str(audio_path), "language": language},
+                json={"audio_path": str(audio_path), "language": language, "text": text},
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

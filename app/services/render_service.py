@@ -48,10 +48,32 @@ _TITLE_Y  = 560   # story title  (~29% from top)
 _PARTNO_Y = 645   # "Part X / Y" (~34% from top)
 _FOLLOW_Y = 725   # "Follow for Part X" CTA (~38% from top)
 
+# On-screen labels per language: (part counter, follow CTA)
+_LABELS: dict[str, tuple[str, str]] = {
+    "en": ("PART {n} / {total}", "Follow for Part {next}"),
+    "de": ("TEIL {n} / {total}", "Folgen für Teil {next}"),
+    "fr": ("PARTIE {n} / {total}", "Abonne-toi pour la partie {next}"),
+    "es": ("PARTE {n} / {total}", "Sígueme para la parte {next}"),
+}
+
 # Tail padding & fade
 _TAIL_SILENCE_S = 3.5   # seconds of silence appended after last spoken word
 _FADE_OUT_S     = 1.5   # duration of the fade-to-black at video end
 _FADE_IN_S      = 0.5   # duration of the fade-from-black at video start
+
+
+def _ass_escape(text: str) -> str:
+    """
+    Make arbitrary text safe for an ASS Dialogue line: braces start override
+    blocks and backslashes start escapes (\\N, \\h), so they are replaced.
+    """
+    return (
+        text.replace("\\", "/")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
 
 
 def _pick_random(directory: Path, extensions: list[str]) -> Path | None:
@@ -144,6 +166,7 @@ def render_part(
     audio_path: Path,
     timestamps_path: Path,
     output_path: Path,
+    language_code: str = "en",
 ) -> Path:
     """
     Render one video part using ffmpeg directly (avoids moviepy GIL limitations).
@@ -191,7 +214,9 @@ def render_part(
 
     # Generate ASS subtitle file from word timestamps
     ass_path = output_path.with_suffix(".ass")
-    _write_ass_subtitles(words, ass_path, part_number, total_parts, story_title, total_dur, wav_duration)
+    _write_ass_subtitles(
+        words, ass_path, part_number, total_parts, story_title, total_dur, wav_duration, language_code
+    )
 
     # Build ffmpeg command
     cmd = _build_ffmpeg_cmd(
@@ -312,6 +337,7 @@ def _write_ass_subtitles(
     story_title: str = "",
     total_duration: float = 0.0,
     audio_duration: float = 0.0,
+    language_code: str = "en",
 ) -> None:
     """
     Write an ASS subtitle file with:
@@ -322,7 +348,9 @@ def _write_ass_subtitles(
     font_name = "Courier Prime"
 
     events    = _word_events(words, audio_duration)
-    audio_end = words[-1].get("end", 0.0) if words else 0.0
+    # WAV duration is ground truth; the last word may be unaligned (end=0.0).
+    audio_end = max(audio_duration, words[-1].get("end", 0.0) if words else 0.0)
+    part_fmt, follow_fmt = _LABELS.get(language_code, _LABELS["en"])
     vid_end   = total_duration if total_duration > audio_end else audio_end
     t0        = _secs_to_ass_time(0.0)
     tend      = _secs_to_ass_time(vid_end)
@@ -370,10 +398,10 @@ def _write_ass_subtitles(
     if story_title:
         lines.append(
             f"Dialogue: 0,{t0},{tend},Header,,0,0,0,,"
-            f"{{\\pos({_CENTER_X},{_TITLE_Y})}}{story_title.upper()}"
+            f"{{\\pos({_CENTER_X},{_TITLE_Y})}}{_ass_escape(story_title.upper())}"
         )
 
-    part_label = f"PART {part_number} / {total_parts}"
+    part_label = part_fmt.format(n=part_number, total=total_parts)
     lines.append(
         f"Dialogue: 0,{t0},{tend},Header,,0,0,0,,"
         f"{{\\pos({_CENTER_X},{_PARTNO_Y})}}{part_label}"
@@ -385,12 +413,12 @@ def _write_ass_subtitles(
         end   = _secs_to_ass_time(ev["end"])
         lines.append(
             f"Dialogue: 0,{start},{end},Default,,0,0,0,,"
-            f"{{\\pos({_CENTER_X},{_GOLDEN_Y})}}{ev['text']}"
+            f"{{\\pos({_CENTER_X},{_GOLDEN_Y})}}{_ass_escape(ev['text'])}"
         )
 
     # ── "Follow for Part N+1" CTA (last 3 s, non-final parts only) ───────────
     if part_number < total_parts and audio_end > 3.0:
-        follow_label = f"Follow for Part {part_number + 1}"
+        follow_label = follow_fmt.format(next=part_number + 1)
         follow_start = _secs_to_ass_time(audio_end - 3.0)
         follow_end   = _secs_to_ass_time(vid_end)
         lines.append(
