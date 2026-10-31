@@ -1,0 +1,42 @@
+# Secrets
+.env
+
+# Runtime data (DB, models, caches, scrape state)
+data/*
+!data/.gitkeep
+reddit_fetch_state.json
+
+# Rendered output
+output/*
+!output/.gitkeep
+
+# Large / third-party / auto-downloaded assets (keep folder structure)
+assets/backgrounds/*
+!assets/backgrounds/.gitkeep
+assets/music/*
+!assets/music/.gitkeep
+assets/fonts/*
+!assets/fonts/.gitkeep
+assets/voice/*
+!assets/voice/.gitkeep
+assets/pdf/*
+!assets/pdf/.gitkeep
+
+# Windows Voxtral binaries (downloaded by start_voxtral_host.sh)
+voxtral_windows_bin/*.exe
+voxtral_windows_bin/*.zip
+
+# Scratch
+scratch/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+.DS_Store

@@ -1,0 +1,40 @@
+# ── Stage 1: Rust build ────────────────────────────────────────────────────────
+# CPU-only build — wgpu (Vulkan/GL) ist in Docker-WSL2 nicht nutzbar:
+#   Vulkan: D3D12 Escape-Calls vom WSL2-Hypervisor blockiert
+#   EGL/GL: NVIDIA injiziert libEGL_nvidia.so nicht in WSL2-Docker-Container
+# CLAUDE.md sieht CPU für TTS vor ("Audio Generation (CPU/RAM)").
+# Mit euler_steps=1 ist die Geschwindigkeit für Produktion akzeptabel.
+FROM rust:1-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth=1 https://github.com/TrevorS/voxtral-mini-realtime-rs /build
+
+WORKDIR /build
+# cli + native-tokenizer, kein wgpu. Burn nutzt ndarray (CPU) als Fallback.
+RUN cargo build --release --features "cli,native-tokenizer"
+
+# ── Stage 2: Python HTTP wrapper runtime ──────────────────────────────────────
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/voxtral /usr/local/bin/voxtral
+
+WORKDIR /app
+
+COPY voxtral_service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY voxtral_service/main.py .
+
+EXPOSE 8700
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8700"]

@@ -1,0 +1,90 @@
+# ── Shared GPU resource definition ───────────────────────────────────────────
+x-gpu-resources: &gpu-resources
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            # Wir fügen 'display' hinzu, damit Vulkan/WGPU den Monitor-Adapter
+            # (auch wenn er virtuell ist) für das Rendering findet.
+            capabilities: [compute, graphics, utility, display]
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  whisperx_cache:
+    driver: local
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  # ── FastAPI Backend ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: bash -c "chmod -R 777 /data 2>/dev/null || true && chmod -R 777 /output 2>/dev/null || true && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - '8000:8000'
+    volumes:
+      - ./data:/data
+      - ./assets:/assets
+      - ./output:/output
+      - ./app:/app/app
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+    env_file:
+      - .env
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    depends_on:
+      - whisperx
+    # Voxtral läuft auf dem WSL2-Host (GPU via Vulkan) — erreichbar über host.docker.internal:8700
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    restart: unless-stopped
+    <<: *gpu-resources
+
+  # ── Streamlit UI ─────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: bash -c "chmod -R 777 /data 2>/dev/null || true && streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - '8501:8501'
+    volumes:
+      - ./data:/data
+      - ./output:/output
+      - ./ui:/app/ui
+    env_file:
+      - .env
+    environment:
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── WhisperX CUDA Microservice ────────────────────────────────────────
+  whisperx:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisperx
+    ports:
+      - '8600:8600'
+    volumes:
+      - ./assets:/assets
+      - ./output:/output
+      - whisperx_cache:/root/.cache/whisperx
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    restart: unless-stopped
+    <<: *gpu-resources
+
+  # ── Voxtral TTS Engine läuft auf dem WSL2-HOST ─────────────────────────
+  # Starte manuell mit: ./start_voxtral_host.sh
+  # Vulkan funktioniert auf dem Host (Mesa D3D12), aber NICHT in Docker-Containern.
+  # Der Docker-API-Container erreicht den Service über extra_hosts: host.docker.internal
+  # voxtral-engine:  ← absichtlich deaktiviert
