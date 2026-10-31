@@ -42,6 +42,16 @@
 5. **Rendering (GPU):** ffmpeg overlays word-by-word ASS subtitles (Courier Prime, outline) and localized "Part x / y" + follow CTA over a random background and music, exported via `h264_nvenc`.
 6. **Export:** When all parts of a story are done the pipeline writes `.done`; `export_watcher.sh` (WSL host) copies the videos + `description.txt` to Google Drive and deletes the local folder. `RenderJob.file_path` therefore points to a deleted file afterwards.
 
+### 3.3. Operations (host scripts, all dry runs unless `--apply`)
+- `cleanup_orphan_rows.py` — delete translations/parts/jobs whose story no longer exists.
+- `cleanup_orphan_files.py` — delete output folders of stories that no longer exist.
+- `resplit_unstarted_stories.py` — drop parts of not-yet-started stories so the poller re-splits them.
+- `mark_for_rewrite.py [ids]` / `rewrite_marked_stories.py [--limit N]` — Claude rewrite of own stories.
+- `fetch_reddit.py`, `reddit_ingest.py` — Reddit ingestion (see docs/STATUS.md § 2 before touching).
+- `export_watcher.sh` — copies finished stories to Google Drive and deletes them locally.
+
+**Current state, open items and the user's product decisions: `docs/STATUS.md`.**
+
 ---
 
 ## 4. Coding Standards & Rules for Claude
