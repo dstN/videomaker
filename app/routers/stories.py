@@ -47,6 +47,7 @@ async def generate_story_preview(
                 text_snippet=p["text_snippet"],
                 word_count=p.get("word_count", len(p["text_snippet"].split())),
                 cliffhanger_note=p.get("cliffhanger_note", ""),
+                recap=p.get("recap", ""),
             )
             for p in parts
         ],
@@ -93,6 +94,7 @@ async def generate_followup_preview(
                 text_snippet=p["text_snippet"],
                 word_count=p.get("word_count", len(p["text_snippet"].split())),
                 cliffhanger_note=p.get("cliffhanger_note", ""),
+                recap=p.get("recap", ""),
             )
             for p in parts
         ],

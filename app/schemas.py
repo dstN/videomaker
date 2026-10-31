@@ -13,6 +13,7 @@ class PartIn(BaseModel):
     part_number: int
     text_snippet: str = Field(..., min_length=1)
     cliffhanger_note: str = ""
+    recap: str = ""
 
 
 class StoryCreate(BaseModel):
@@ -47,6 +48,7 @@ class PartPreview(BaseModel):
     text_snippet: str
     word_count: int
     cliffhanger_note: str
+    recap: str = ""
 
 
 class StoryGeneratePreviewResponse(BaseModel):
@@ -96,6 +98,7 @@ class VideoPartResponse(BaseModel):
     part_number: int
     text_snippet: str
     cliffhanger_note: str | None
+    recap: str | None = None
     audio_path: str | None
     timestamps_path: str | None
     render_jobs: list[RenderJobResponse] = []

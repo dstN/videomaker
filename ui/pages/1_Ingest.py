@@ -80,6 +80,8 @@ if "preview" in st.session_state:
         for part in preview["parts"]:
             st.markdown(f"**Part {part['part_number']}** - {part['word_count']} Woerter")
             st.markdown(f"*Cliffhanger: {part['cliffhanger_note']}*")
+            if part.get("recap"):
+                st.markdown(f"🔁 **Einstieg:** _{part['recap']}_")
             st.text(part["text_snippet"])
             st.divider()
 

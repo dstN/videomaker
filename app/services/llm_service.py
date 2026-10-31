@@ -162,6 +162,10 @@ class _Rewrite(BaseModel):
     text: str
 
 
+class _Recaps(BaseModel):
+    recaps: list[str]
+
+
 class _ContinuityEdit(BaseModel):
     find: str
     replace: str
@@ -474,6 +478,7 @@ def _build_parts(
             "text_snippet": snippet,
             "word_count": len(snippet.split()),
             "cliffhanger_note": notes[idx] if idx < len(notes) else "",
+            "recap": "",
         })
         start = end
     return parts
@@ -502,6 +507,8 @@ async def split_into_parts(
     """
     settings = get_settings()
     min_w, max_w = settings.part_min_words, settings.part_max_words
+    if settings.part_recaps:
+        max_w -= settings.recap_max_words  # leave room for the spoken recap
 
     spans = split_sentences(text)
     if not spans:
@@ -566,7 +573,71 @@ async def split_into_parts(
         if not open_ending:
             notes = [""] * (len(ends) - 1) + ["RESOLUTION"]
 
-    return title, _build_parts(text, spans, ends, notes)
+    parts = _build_parts(text, spans, ends, notes)
+    if settings.part_recaps and len(parts) > 1:
+        recaps = await generate_recaps([p["text_snippet"] for p in parts], lang)
+        for part, recap in zip(parts, recaps):
+            part["recap"] = recap
+    return title, parts
+
+
+async def _generate_structured(
+    task_prompt: str, model_cls: type[_ModelT], temperature: float = 0.7
+) -> _ModelT:
+    """Short structured writing task: Claude when STORY_LLM=claude (medium effort), else Gemini."""
+    if get_settings().story_llm == "claude" and claude_service.is_configured():
+        try:
+            return await claude_service.generate_json(
+                _SYSTEM_INSTRUCTION, task_prompt, model_cls, effort="medium"
+            )
+        except claude_service.ClaudeError as exc:
+            logger.warning("Claude failed (%s) — using Gemini.", exc)
+    client, model_name, fallback_models, _ = await _resolve_model_async()
+    gen_config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=model_cls,
+        temperature=temperature,
+    )
+    response = await _generate_with_fallback(client, model_name, fallback_models, [task_prompt], gen_config)
+    return _parse_model(response, model_cls)
+
+
+async def generate_recaps(parts: list[str], lang: str = "en") -> list[str]:
+    """
+    One orienting opening sentence per part, for viewers who start mid-series.
+    Returns a list aligned with parts: '' for part 1 and wherever no usable
+    recap came back. Never raises — recaps are optional.
+    """
+    n = len(parts)
+    if n < 2:
+        return [""] * n
+    max_words = get_settings().recap_max_words
+    numbered = "\n\n".join(f"=== PART {i} ===\n{t}" for i, t in enumerate(parts, 1))
+    task_prompt = (
+        f"TASK: The story below is published as {n} separate short videos, and many viewers "
+        f"start at a later part. For each of parts 2 to {n}, write ONE sentence in "
+        f"{lang.upper()} that the narrator says right before that part begins.\n"
+        "- It orients a new viewer: who the narrator is and the situation at that moment.\n"
+        f"- At most {max_words} words, first person, same voice and tense as the story.\n"
+        "- Reveal nothing that happens in that part or later.\n"
+        "- No meta references ('previously', 'in the last part', 'video').\n"
+        f"Return exactly {n - 1} sentences in 'recaps', in order (part 2 first).\n\n"
+        f"STORY:\n{numbered}"
+    )
+    try:
+        result = await _generate_structured(task_prompt, _Recaps)
+    except Exception as exc:
+        logger.warning("Recap generation failed (%s) — parts get no recap.", str(exc)[:200])
+        return [""] * n
+
+    recaps = [r.strip() for r in result.recaps]
+    if len(recaps) != n - 1:
+        logger.warning("Got %d recaps for %d parts — parts get no recap.", len(recaps), n - 1)
+        return [""] * n
+    # Tolerate a little overshoot; longer lines would eat into the 180 s budget
+    limit = int(max_words * 1.25)
+    return [""] + [r if 0 < len(r.split()) <= limit else "" for r in recaps]
 
 
 _CONTINUITY_PROMPT = (

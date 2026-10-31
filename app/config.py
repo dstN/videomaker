@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     max_part_seconds: float = 180.0
     part_min_words: int = 190
     part_max_words: int = 460
+    # Recap: one orienting opening sentence for every part after the first,
+    # for viewers who start mid-series. Its words are reserved from the part
+    # budget so the 180 s limit still holds.
+    part_recaps: bool = True
+    recap_max_words: int = 20
     # Max parts per story; longer stories are split into a series of stories
     # ("<title> – Part 1", "– Part 2", ...) with at most this many parts each.
     max_parts: int = 6

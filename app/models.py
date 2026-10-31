@@ -108,6 +108,8 @@ class VideoPart(Base):
     part_number: Mapped[int] = mapped_column(Integer, nullable=False)
     text_snippet: Mapped[str] = mapped_column(Text, nullable=False)
     cliffhanger_note: Mapped[str] = mapped_column(String(512), nullable=True)
+    # Spoken (and subtitled) before text_snippet; not part of the story text
+    recap: Mapped[str | None] = mapped_column(Text, nullable=True)
     audio_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     timestamps_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 

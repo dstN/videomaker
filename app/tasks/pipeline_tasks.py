@@ -376,6 +376,7 @@ def store_parts(
                 part_number=number,
                 text_snippet=raw["text_snippet"],
                 cliffhanger_note=raw.get("cliffhanger_note", ""),
+                recap=raw.get("recap") or None,
             )
             part.render_jobs.append(RenderJob(status=JobStatus.pending))
             db.add(part)
@@ -399,6 +400,13 @@ def store_parts(
 
     db.commit()
     return series
+
+
+def narration(part: VideoPart) -> str:
+    """What is spoken for a part: the recap sentence (if any), then the snippet."""
+    if part.recap:
+        return f"{part.recap}\n\n{part.text_snippet}"
+    return part.text_snippet
 
 
 # ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -552,7 +560,7 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
 
                 try:
                     await tts_service.generate_audio(
-                        part.text_snippet, audio_path, language_code, voice=story_voice
+                        narration(part), audio_path, language_code, voice=story_voice
                     )
                     part.audio_path = str(audio_path)
                     db.commit()
@@ -575,7 +583,7 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
                     words = await whisperx_service.transcribe(
                         audio_path,
                         language_code,
-                        text=tts_service.spoken_text(part.text_snippet, language_code),
+                        text=tts_service.spoken_text(narration(part), language_code),
                     )
                     timestamps_path.write_text(json.dumps(words), encoding="utf-8")
                     part.timestamps_path = str(timestamps_path)
