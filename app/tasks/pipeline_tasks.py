@@ -237,7 +237,7 @@ def _find_stories_with_pending_jobs() -> list[tuple[int, str]]:
         )
         for story in untranslated:
             if story.id not in seen_story_ids:
-                results.append((story.id, "en"))  # default to English
+                results.append((story.id, story.source_language or "en"))
 
         return results
     finally:

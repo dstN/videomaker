@@ -68,6 +68,8 @@ class StoryResponse(BaseModel):
     parent_story_id: int | None = None
     followup_mode: str | None = None
     open_ending: bool = False
+    rewrite_requested: bool = False
+    rewritten_from_id: int | None = None
     created_at: datetime
     translations: list[TranslationResponse] = []
 

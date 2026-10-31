@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3-flash-preview"
     gemini_fallback_model: str = "gemma-4-31b-it"  # Used on 429 rate-limit; much higher quota
 
+    # Claude (story writing). STORY_LLM=claude writes stories with Claude and
+    # falls back to Gemini; splitting, descriptions and translation stay on Gemini.
+    anthropic_api_key: str = ""
+    story_llm: str = "claude"            # "claude" | "gemini"
+    claude_model: str = "claude-opus-5-5"
+    claude_effort: str = "high"          # low | medium | high | xhigh | max
+    story_continuity_pass: bool = True   # second, cheap Claude call that fixes contradictions
+
     # Service URLs
     api_base_url: str = "http://api:8000"
     whisperx_url: str = "http://whisperx:8600"

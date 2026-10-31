@@ -30,6 +30,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.services import claude_service
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +62,25 @@ FORBIDDEN STRUCTURAL PATTERNS — your output will be rejected if these appear:
 4. Rhetorical questions as cliffhangers: avoid "What could it mean?" type endings
 5. Em-dash overuse: maximum one em-dash per paragraph
 
+STORY CRAFT — these are the most common failures, avoid them:
+1. At most ONE supernatural or horror element plus ONE twist. Do not stack threats
+   (robot + electric fence + bunker + villain + bomb reads like a checklist).
+2. The truth must NOT be explained by a found manual, file, recording, letter or an
+   antagonist's monologue. Let the narrator and other characters piece it together
+   through what they see, hear and say.
+3. Continuity: objects, names, distances, travel times and the time of day must stay
+   consistent from start to finish (the same radio stays the same radio).
+4. Every important character, including an antagonist, needs presence and a motive
+   before the climax — nobody appears only to explain or to die.
+5. Spend time where the dread is strongest (conversations, waiting, small wrong details)
+   instead of rushing to the next set piece.
+
 STYLE REQUIREMENTS:
 - Write in first-person past tense exclusively
-- Ground horror in hyper-specific, mundane details (brand names, exact times, physical sensations)
-- Use sentence rhythm variation: mix short punchy sentences with longer ones
+- Ground horror in concrete physical and sensory details. Brand names only when they
+  matter to the plot — at most one per ~400 words.
+- Vary sentence length: mostly medium and longer sentences; short sentences only at
+  tension peaks. Long runs of short fragments become monotonous.
 - Cliffhangers must create dread through implication, not cheap shock
 - No purple prose. No melodrama. Restraint is more terrifying than excess.
 - Times and dates must feel incidental and specific — never symbolically loaded (no 3 AM)"""
@@ -144,6 +160,16 @@ class _SplitPlan(BaseModel):
 class _Rewrite(BaseModel):
     title: str
     text: str
+
+
+class _ContinuityEdit(BaseModel):
+    find: str
+    replace: str
+    reason: str
+
+
+class _ContinuityReport(BaseModel):
+    edits: list[_ContinuityEdit]
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -543,8 +569,65 @@ async def split_into_parts(
     return title, _build_parts(text, spans, ends, notes)
 
 
-async def _generate_story_text(task_prompt: str) -> tuple[str, str]:
-    """Run a creative generation prompt and return (title, full story text)."""
+_CONTINUITY_PROMPT = (
+    "TASK: Proofread the horror story below for continuity errors only: objects that change "
+    "(e.g. one radio model becomes another), names, distances and travel times that contradict "
+    "each other, impossible timelines, and facts stated twice in conflicting ways.\n"
+    "Do NOT change style, plot or wording beyond what a fix needs.\n"
+    "For each error return an edit: 'find' = an exact, unique passage copied verbatim from the "
+    "story (one sentence or less), 'replace' = the corrected passage, 'reason' = a few words.\n"
+    "Return an empty list if the story is consistent.\n\nSTORY:\n"
+)
+
+
+def _apply_edits(text: str, edits: list[_ContinuityEdit]) -> str:
+    """Apply find/replace edits whose 'find' occurs exactly once; skip the rest."""
+    for edit in edits:
+        if not edit.find or text.count(edit.find) != 1:
+            logger.warning("Continuity edit skipped (not unique): %r", edit.find[:80])
+            continue
+        text = text.replace(edit.find, edit.replace)
+        logger.info("Continuity fix: %s", edit.reason)
+    return text
+
+
+async def _claude_story(task_prompt: str) -> tuple[str, str]:
+    settings = get_settings()
+    draft = await claude_service.generate_json(_SYSTEM_INSTRUCTION, task_prompt, _StoryDraft)
+    title, text = draft.story_title.strip(), draft.text.strip()
+    if settings.story_continuity_pass:
+        try:
+            report = await claude_service.generate_json(
+                _SYSTEM_INSTRUCTION, _CONTINUITY_PROMPT + text, _ContinuityReport, effort="medium"
+            )
+            text = _apply_edits(text, report.edits)
+        except claude_service.ClaudeError as exc:
+            logger.warning("Continuity pass failed (%s) — keeping the draft.", exc)
+    return title, text
+
+
+async def _generate_story_text(
+    task_prompt: str, require_claude: bool = False
+) -> tuple[str, str]:
+    """
+    Run a creative generation prompt and return (title, full story text).
+    STORY_LLM=claude writes with Claude (plus a continuity pass) and falls back
+    to Gemini if Claude is unavailable, refuses or fails — unless
+    require_claude is set, then the ClaudeError propagates.
+    """
+    if require_claude or get_settings().story_llm == "claude":
+        if claude_service.is_configured():
+            try:
+                return await _claude_story(task_prompt)
+            except claude_service.ClaudeError as exc:
+                if require_claude:
+                    raise
+                logger.warning("Claude story generation failed (%s) — falling back to Gemini.", exc)
+        elif require_claude:
+            raise claude_service.ClaudeError("ANTHROPIC_API_KEY is not set.")
+        else:
+            logger.warning("STORY_LLM=claude but ANTHROPIC_API_KEY is not set — using Gemini.")
+
     client, model_name, fallback_models, pdf_file = await _resolve_model_async()
     contents: list = ([pdf_file, task_prompt] if pdf_file is not None else [task_prompt])
     gen_config = types.GenerateContentConfig(
@@ -726,6 +809,63 @@ async def generate_followup(
     title, text = await _generate_story_text(task_prompt)
     split_title, parts = await split_into_parts(text, lang, open_ending=open_ending)
     return title or split_title, parts
+
+
+_REWRITE_MODE_CONTEXT = {
+    "sequel": "This story is a SEQUEL to the parent story below — it continues after it ends.",
+    "prequel": "This story is a PREQUEL to the parent story below — it is set before it.",
+    "expansion": "This story EXPANDS the parent story below with scenes left off-screen.",
+}
+
+
+async def rewrite_own_story(
+    title: str,
+    text: str,
+    lang: str = "en",
+    open_ending: bool = False,
+    parent_title: str | None = None,
+    parent_text: str | None = None,
+    followup_mode: str | None = None,
+    require_claude: bool = False,
+) -> tuple[str, str]:
+    """
+    Rewrite one of our own generated stories from scratch, keeping premise,
+    twist and ending type but fixing the weaknesses the STORY CRAFT rules name.
+    For follow-ups, the (already rewritten) parent is passed as context.
+    Returns (title, text). Not for scraped stories — see rewrite_story().
+    """
+    words = len(text.split())
+    ending = (
+        "Keep the open ending: the last scene must leave the threat unresolved."
+        if open_ending else
+        "Keep a concrete ending that resolves the central threat or mystery."
+    )
+    parent_block = ""
+    if parent_text:
+        context = _REWRITE_MODE_CONTEXT.get(followup_mode or "", "This story follows the parent story below.")
+        parent_block = (
+            f"{context} Stay consistent with its characters, places and events.\n\n"
+            f"PARENT STORY (read-only context):\nTitle: {parent_title or 'Untitled'}\n\n"
+            f"{parent_text}\n\n--- END OF PARENT STORY ---\n\n"
+        )
+
+    task_prompt = (
+        f"TASK: Rewrite the r/nosleep story below from scratch, in {lang.upper()}. It was "
+        "machine-generated and has the typical weaknesses the STORY CRAFT rules describe.\n\n"
+        f"{parent_block}"
+        "KEEP: the premise, the setting, the narrator, the central twist and the ending type. "
+        f"{ending}\n"
+        "CHANGE FREELY: structure, scenes, secondary characters and wording. Cut elements so "
+        "only one horror element and one twist remain; replace any exposition-by-document with "
+        "discovery; remove brand names that do not matter to the plot; fix continuity.\n"
+        f"- Length: about {words} words (±15%).\n"
+        "- The story will be cut into 1-3 minute video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 250-400 words.\n"
+        "- story_title: a short evocative title (≤6 words); keep the original title if it works.\n\n"
+        f"ORIGINAL TITLE: {title}\n\nORIGINAL STORY:\n{text}\n\n"
+        "Return the full rewritten story as plain prose in 'text' (paragraphs separated by blank lines)."
+    )
+    return await _generate_story_text(task_prompt, require_claude=require_claude)
 
 
 async def translate_text(text: str, target_lang: str, source_lang: str = "en") -> str:

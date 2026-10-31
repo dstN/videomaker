@@ -48,6 +48,10 @@ for story in stories:
         _followup_label = f" {_icon} {story['followup_mode'].capitalize()} von: {_parent_name}"
 
     _open_ending_badge = " 🔓 Offenes Ende" if story.get("open_ending") else ""
+    if story.get("rewritten_from_id"):
+        _open_ending_badge += f" ✍ Rewrite von #{story['rewritten_from_id']}"
+    if story.get("rewrite_requested"):
+        _open_ending_badge += " ✍ zum Rewrite markiert"
 
     with st.expander(
         f"Story #{story['id']} — {story['title'] or story['created_at'][:19].replace('T', ' ')}{_followup_label}{_open_ending_badge}",
@@ -144,7 +148,7 @@ for story in stories:
         if gen_sequel:
             lang_code = SUPPORTED_LANGUAGES[lang_label]
             mode_code = FOLLOWUP_MODES[mode_label]
-            with st.spinner(f"Gemini schreibt das {mode_label.split()[1]}..."):
+            with st.spinner(f"Das {mode_label.split()[1]} wird geschrieben... (kann 1-3 Minuten dauern)"):
                 try:
                     r = requests.post(
                         f"{API_BASE}/stories/followup-preview",
@@ -154,7 +158,7 @@ for story in stories:
                             "mode": mode_code,
                             "open_ending": open_ending_fup,
                         },
-                        timeout=180,
+                        timeout=360,
                     )
                     r.raise_for_status()
                     st.session_state[sequel_key] = r.json()

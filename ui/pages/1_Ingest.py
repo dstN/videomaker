@@ -6,7 +6,7 @@ API_BASE = os.getenv("API_BASE_URL", "http://api:8000")
 
 st.set_page_config(page_title="Story Generator", page_icon="✨", layout="centered")
 st.title("✨ Story Generator")
-st.caption("Gib einen Prompt ein — Gemini schreibt die r/nosleep Story und teilt sie in Video-Parts auf.")
+st.caption("Gib einen Prompt ein — Claude (oder Gemini, je nach STORY_LLM) schreibt die r/nosleep Story, danach wird sie in Video-Parts aufgeteilt.")
 
 SUPPORTED_LANGUAGES = {
     "English (EN)": "en",
@@ -41,12 +41,12 @@ if generate_btn:
 
     lang_code = SUPPORTED_LANGUAGES[language_label]
 
-    with st.spinner("Gemini schreibt die Story... (kann 20-60 Sekunden dauern)"):
+    with st.spinner("Die Story wird geschrieben... (kann 1-3 Minuten dauern)"):
         try:
             resp = requests.post(
                 f"{API_BASE}/stories/generate-preview",
                 json={"prompt": prompt.strip(), "language": lang_code, "open_ending": open_ending},
-                timeout=120,
+                timeout=360,
             )
             resp.raise_for_status()
             preview = resp.json()

@@ -56,6 +56,14 @@ class Story(Base):
         String(32), nullable=True
     )  # 'sequel' | 'prequel' | 'expansion' | 'continuation' (series split) | None
     open_ending: Mapped[bool] = mapped_column(Integer, nullable=False, default=0)
+    # Claude rewrite: marked stories are rewritten by rewrite_marked_stories.py
+    # into a new Story whose rewritten_from_id points back here.
+    rewrite_requested: Mapped[bool] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    rewritten_from_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("stories.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,
@@ -64,6 +72,9 @@ class Story(Base):
 
     parent: Mapped[Story | None] = relationship(
         "Story", remote_side="Story.id", foreign_keys="Story.parent_story_id", lazy="select"
+    )
+    rewritten_from: Mapped[Story | None] = relationship(
+        "Story", remote_side="Story.id", foreign_keys="Story.rewritten_from_id", lazy="select"
     )
     translations: Mapped[list[Translation]] = relationship(
         "Translation", back_populates="story", cascade="all, delete-orphan"
