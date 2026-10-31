@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import torch
 import whisperx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -122,15 +123,22 @@ def transcribe(request: TranscribeRequest) -> TranscribeResponse:
 
         if request.text and request.text.strip():
             duration = len(audio) / SAMPLE_RATE
-            words = _align([{"text": request.text, "start": 0.0, "end": duration}], audio)
+            try:
+                words = _align([{"text": request.text, "start": 0.0, "end": duration}], audio)
+            except Exception:
+                # e.g. CUDA OOM on a long single segment — ASR splits into short segments
+                logger.exception("Forced alignment failed for %s — falling back to ASR.", audio_path.name)
+                torch.cuda.empty_cache()
+                words = []
             timed = sum(1 for w in words if w.end > 0)
             expected = len(request.text.split())
             if expected and timed / expected >= MIN_ALIGNED_RATIO:
                 return TranscribeResponse(words=words)
-            logger.warning(
-                "Forced alignment placed only %d/%d words for %s — falling back to ASR.",
-                timed, expected, audio_path.name,
-            )
+            if words:
+                logger.warning(
+                    "Forced alignment placed only %d/%d words for %s — falling back to ASR.",
+                    timed, expected, audio_path.name,
+                )
 
         result = _model.transcribe(audio, batch_size=16, language=request.language)
         return TranscribeResponse(words=_align(result["segments"], audio))
