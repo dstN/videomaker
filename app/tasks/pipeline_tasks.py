@@ -595,30 +595,3 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
         logger.exception("Unhandled pipeline error for story %d: %s", story_id, exc)
     finally:
         db.close()
-
-
-# ── Retry a single job ────────────────────────────────────────────────────────
-
-async def retry_job(job_id: int) -> None:
-    """
-    Re-run the pipeline for a single failed RenderJob.
-    Resets job to appropriate retry state and re-runs from there.
-    """
-    db: Session = SessionLocal()
-    try:
-        job: RenderJob | None = db.get(RenderJob, job_id)
-        if job is None:
-            logger.error("RenderJob %d not found.", job_id)
-            return
-
-        part: VideoPart = job.video_part
-        translation: Translation = part.translation
-
-        # Reset status based on available artifacts
-        job.status = _resume_status(part)
-        job.error_message = None
-        db.commit()
-
-        await run_pipeline(translation.story_id, translation.language_code)
-    finally:
-        db.close()
