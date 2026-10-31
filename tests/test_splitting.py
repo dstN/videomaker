@@ -89,12 +89,12 @@ def _patch_llm(monkeypatch, plan):
 
 
 def test_split_uses_valid_llm_plan_verbatim(monkeypatch):
-    text = _long_story(140)  # 140 sentences × 8 words = 1120 words
+    text = _long_story(100)  # 100 sentences × 8 words = 800 words
     plan = llm_service._SplitPlan(
         story_title="Eight Words",
         parts=[
-            llm_service._SplitBoundary(end_sentence=60, cliffhanger_note="a"),
-            llm_service._SplitBoundary(end_sentence=140, cliffhanger_note="RESOLUTION"),
+            llm_service._SplitBoundary(end_sentence=45, cliffhanger_note="a"),
+            llm_service._SplitBoundary(end_sentence=100, cliffhanger_note="RESOLUTION"),
         ],
     )
     _patch_llm(monkeypatch, plan)
@@ -102,7 +102,7 @@ def test_split_uses_valid_llm_plan_verbatim(monkeypatch):
     title, parts = asyncio.run(llm_service.split_into_parts(text))
 
     assert title == "Eight Words"
-    assert [p["word_count"] for p in parts] == [480, 640]
+    assert [p["word_count"] for p in parts] == [360, 440]
     assert [p["cliffhanger_note"] for p in parts] == ["a", "RESOLUTION"]
     assert " ".join(p["text_snippet"] for p in parts) == text
 
@@ -119,24 +119,36 @@ def test_split_falls_back_when_plan_drops_text(monkeypatch):
     _, parts = asyncio.run(llm_service.split_into_parts(text))
 
     assert " ".join(p["text_snippet"] for p in parts) == text
-    assert all(370 <= p["word_count"] <= 740 for p in parts)
-    assert len(parts) <= 6
+    assert all(190 <= p["word_count"] <= 460 for p in parts)
     assert parts[-1]["cliffhanger_note"] == "RESOLUTION"
 
 
-def test_split_rejects_plan_with_too_many_parts(monkeypatch):
-    text = _long_story(560)  # 4480 words
+def test_split_rejects_parts_over_hard_word_limit(monkeypatch):
+    text = _long_story(120)  # 960 words
     plan = llm_service._SplitPlan(
         story_title="T",
-        parts=[llm_service._SplitBoundary(end_sentence=e, cliffhanger_note="x")
-               for e in range(70, 561, 70)],  # 8 parts of 560 words — in range, but too many
+        parts=[
+            llm_service._SplitBoundary(end_sentence=60, cliffhanger_note="x"),  # 480 > 460
+            llm_service._SplitBoundary(end_sentence=120, cliffhanger_note="x"),
+        ],
     )
     _patch_llm(monkeypatch, plan)
 
     _, parts = asyncio.run(llm_service.split_into_parts(text))
 
-    assert len(parts) == 6
+    assert all(p["word_count"] <= 460 for p in parts)
     assert " ".join(p["text_snippet"] for p in parts) == text
+
+
+def test_split_does_not_cap_part_count(monkeypatch):
+    # The series split happens in store_parts; the splitter keeps the hard word limit
+    text = _long_story(600)  # 4800 words
+    _patch_llm(monkeypatch, RuntimeError("down"))
+
+    _, parts = asyncio.run(llm_service.split_into_parts(text))
+
+    assert len(parts) > 6
+    assert all(190 <= p["word_count"] <= 460 for p in parts)
 
 
 def test_split_falls_back_when_llm_errors(monkeypatch):

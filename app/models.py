@@ -54,7 +54,7 @@ class Story(Base):
     )
     followup_mode: Mapped[str | None] = mapped_column(
         String(32), nullable=True
-    )  # 'sequel' | 'prequel' | 'expansion' | None
+    )  # 'sequel' | 'prequel' | 'expansion' | 'continuation' (series split) | None
     open_ending: Mapped[bool] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

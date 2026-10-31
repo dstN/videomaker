@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -307,6 +308,99 @@ def _set_job_status(
     db.commit()
 
 
+# ── Storing split parts (series for long stories) ─────────────────────────────
+
+# Title suffix for stories split into a series ("<title> – Part 2")
+_SERIES_LABEL = {"en": "Part", "de": "Teil", "fr": "Partie", "es": "Parte"}
+
+
+def series_group_sizes(n_parts: int, max_parts: int) -> list[int]:
+    """
+    Distribute n_parts over as few stories as possible with at most max_parts
+    each, front-loaded: 7 → [4, 3], 8 → [4, 4], 9 → [5, 4], 13 → [5, 4, 4].
+    """
+    if n_parts <= 0:
+        return []
+    groups = math.ceil(n_parts / max_parts)
+    base, extra = divmod(n_parts, groups)
+    return [base + 1] * extra + [base] * (groups - extra)
+
+
+def store_parts(
+    db: Session, story: Story, translation: Translation, raw_parts: list[dict]
+) -> list[Story]:
+    """
+    Persist split parts (VideoPart + pending RenderJob) for a translation.
+
+    A story with more than MAX_PARTS parts becomes a series: the first group
+    stays on this story, every further group becomes a new Story linked via
+    parent_story_id (followup_mode='continuation'), and all get a
+    "<title> – Part N" title. New stories are picked up by the poller.
+    Returns the stories of the series (just [story] if no split was needed).
+    """
+    settings = get_settings()
+    lang = translation.language_code
+    sizes = series_group_sizes(len(raw_parts), settings.max_parts)
+    series: list[Story] = [story]
+
+    start = 0
+    for group_idx, size in enumerate(sizes):
+        group = raw_parts[start:start + size]
+        start += size
+        group_text = "\n\n".join(p["text_snippet"] for p in group)
+        is_last_group = group_idx == len(sizes) - 1
+
+        if group_idx == 0:
+            target = translation
+        else:
+            follow = Story(
+                original_text_en=group_text,
+                source_language=lang,
+                source_url=story.source_url,
+                voice=story.voice,
+                parent_story_id=series[-1].id,
+                followup_mode="continuation",
+                # Every group but the last ends on its cliffhanger
+                open_ending=story.open_ending if is_last_group else True,
+            )
+            db.add(follow)
+            db.flush()
+            target = Translation(story_id=follow.id, language_code=lang, translated_text=group_text)
+            db.add(target)
+            db.flush()
+            series.append(follow)
+
+        for number, raw in enumerate(group, 1):
+            part = VideoPart(
+                translation_id=target.id,
+                part_number=number,
+                text_snippet=raw["text_snippet"],
+                cliffhanger_note=raw.get("cliffhanger_note", ""),
+            )
+            part.render_jobs.append(RenderJob(status=JobStatus.pending))
+            db.add(part)
+
+        if group_idx == 0 and len(sizes) > 1:
+            # The first story now only covers its own group
+            translation.translated_text = group_text
+            if (story.source_language or "en") == lang:
+                story.original_text_en = group_text
+            story.open_ending = True
+
+    if len(series) > 1:
+        base_title = story.title or "Untitled"
+        label = _SERIES_LABEL.get(lang, _SERIES_LABEL["en"])
+        for number, member in enumerate(series, 1):
+            member.title = f"{base_title} – {label} {number}"
+        logger.info(
+            "Story %d split into a series of %d stories (%s parts): %s",
+            story.id, len(series), "/".join(map(str, sizes)), [s.id for s in series],
+        )
+
+    db.commit()
+    return series
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────────────
 
 async def prepare_story_parts(story_id: int, language_code: str) -> None:
@@ -314,7 +408,7 @@ async def prepare_story_parts(story_id: int, language_code: str) -> None:
     1. Assign voice
     2. Fetch or create Translation for language_code
     3. Split text into VideoParts via Gemini
-    4. Create RenderJob stubs
+    4. Create RenderJob stubs (long stories become a series, see store_parts)
     """
     db: Session = SessionLocal()
     try:
@@ -363,28 +457,8 @@ async def prepare_story_parts(story_id: int, language_code: str) -> None:
             )
             if title and not story.title:
                 story.title = title
-                db.commit()
-            for raw in raw_parts:
-                part = VideoPart(
-                    translation_id=translation.id,
-                    part_number=raw["part_number"],
-                    text_snippet=raw["text_snippet"],
-                    cliffhanger_note=raw.get("cliffhanger_note", ""),
-                )
-                db.add(part)
-            db.commit()
-            existing_parts = (
-                db.query(VideoPart)
-                .filter_by(translation_id=translation.id)
-                .order_by(VideoPart.part_number)
-                .all()
-            )
-            logger.info("Created %d video parts.", len(existing_parts))
-
-            for part in existing_parts:
-                if not part.render_jobs:
-                    db.add(RenderJob(video_part_id=part.id, status=JobStatus.pending))
-            db.commit()
+            store_parts(db, story, translation, raw_parts)
+            logger.info("Created %d video parts.", len(raw_parts))
     finally:
         db.close()
 

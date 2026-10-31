@@ -210,7 +210,14 @@ def render_part(
             "using WAV duration to avoid premature cutoff.",
             part_number, wav_duration, whisperx_end,
         )
-    total_dur = audio_end + _TAIL_SILENCE_S
+    # Hard cap: YouTube Shorts allow at most max_part_seconds. TTS already
+    # fits the narration; never render a longer video, never cut speech.
+    if audio_end > settings.max_part_seconds - 0.5:
+        raise RuntimeError(
+            f"Part {part_number}: audio is {audio_end:.1f}s, over the "
+            f"{settings.max_part_seconds:.0f}s video limit — re-split the story."
+        )
+    total_dur = min(audio_end + _TAIL_SILENCE_S, settings.max_part_seconds)
 
     # Generate ASS subtitle file from word timestamps
     ass_path = output_path.with_suffix(".ass")

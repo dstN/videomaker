@@ -75,3 +75,38 @@ def test_connect_error_fails_fast():
     with pytest.raises(TTSError, match="Cannot connect"):
         tts_service._synthesize_with_retry(client, "u", "hi", "v", 3, "chunk 1/1")
     assert client.calls == 1
+
+
+def _wav(seconds: float, rate: int = 24_000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+    return buf.getvalue()
+
+
+def test_fit_duration_keeps_short_audio():
+    wav = _wav(1.0)
+    assert tts_service._fit_duration(wav, 2.0) is wav
+
+
+def test_fit_duration_speeds_up_slightly_long_audio(monkeypatch):
+    calls = []
+
+    def fake_tempo(wav_bytes, tempo):
+        calls.append(tempo)
+        return _wav(2.0)
+
+    monkeypatch.setattr(tts_service, "_apply_tempo", fake_tempo)
+    tts_service._fit_duration(_wav(2.2), 2.0)
+    assert calls and abs(calls[0] - 1.1) < 1e-6
+
+
+def test_fit_duration_fails_when_too_long():
+    with pytest.raises(TTSError, match="over the 2s narration limit"):
+        tts_service._fit_duration(_wav(3.0), 2.0)

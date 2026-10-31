@@ -132,6 +132,12 @@ _INTER_CHUNK_SILENCE_MS = 300
 # ffmpeg atempo range: 0.5 – 2.0.
 _SPEECH_TEMPO = 0.93
 
+# The rendered video appends ~3.5 s of tail silence after the narration
+# (render_service._TAIL_SILENCE_S); keep that much headroom below the limit.
+_VIDEO_TAIL_RESERVE_S = 4.0
+# Audio longer than the limit is sped up by at most this factor to fit.
+_MAX_FIT_SPEEDUP = 1.15
+
 # All available voxtral voice presets
 AVAILABLE_VOICES: list[str] = [
     "casual_female",
@@ -286,6 +292,32 @@ def _apply_tempo(wav_bytes: bytes, tempo: float) -> bytes:
         tmp_out.unlink(missing_ok=True)
 
 
+def _wav_duration(wav_bytes: bytes) -> float:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        return wf.getnframes() / wf.getframerate()
+
+
+def _fit_duration(wav_bytes: bytes, max_seconds: float) -> bytes:
+    """
+    Keep narration within max_seconds: speed it up by at most _MAX_FIT_SPEEDUP,
+    otherwise fail — a longer video would no longer qualify as a Short.
+    """
+    duration = _wav_duration(wav_bytes)
+    if duration <= max_seconds:
+        return wav_bytes
+    factor = duration / max_seconds
+    if factor > _MAX_FIT_SPEEDUP:
+        raise TTSError(
+            f"Part audio is {duration:.1f}s, over the {max_seconds:.0f}s narration limit even at "
+            f"+{(_MAX_FIT_SPEEDUP - 1) * 100:.0f}% speed — lower PART_MAX_WORDS and re-split."
+        )
+    logger.warning("Part audio %.1fs > %.1fs — speeding up by %.3fx to fit.", duration, max_seconds, factor)
+    fitted = _apply_tempo(wav_bytes, factor)
+    if _wav_duration(fitted) > max_seconds + 0.5:
+        raise TTSError(f"Could not fit part audio ({duration:.1f}s) into {max_seconds:.0f}s.")
+    return fitted
+
+
 def _concat_wavs(wav_blobs: list[bytes]) -> bytes:
     """
     Concatenate WAV blobs with 300 ms silence padding between chunks for a
@@ -421,6 +453,7 @@ def _generate_blocking(
     final_wav = _concat_wavs(wav_blobs) if len(wav_blobs) > 1 else wav_blobs[0]
     final_wav = _apply_tempo(final_wav, _SPEECH_TEMPO)
     final_wav = _apply_loudnorm(final_wav)
+    final_wav = _fit_duration(final_wav, settings.max_part_seconds - _VIDEO_TAIL_RESERVE_S)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(final_wav)

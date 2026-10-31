@@ -39,11 +39,14 @@ class Settings(BaseSettings):
     tts_retry_attempts: int = 3
     tts_retry_base_delay: float = 10.0
 
-    # Video part length (words). Voxtral speaks ~3.1 words/s (measured on
-    # rendered parts), so 370-740 words ≈ 120-240 s of narration.
-    part_min_words: int = 370
-    part_max_words: int = 740
-    # Hard cap per story — longer stories get longer parts, not more parts.
+    # Video part length. Hard limit: YouTube Shorts allow at most 180 s.
+    # Voxtral speaks 2.65-3.2 words/s (measured on rendered parts); 460 words
+    # stay under ~174 s even at the slow end, 190 words ≈ 60 s at 3.1 words/s.
+    max_part_seconds: float = 180.0
+    part_min_words: int = 190
+    part_max_words: int = 460
+    # Max parts per story; longer stories are split into a series of stories
+    # ("<title> – Part 1", "– Part 2", ...) with at most this many parts each.
     max_parts: int = 6
 
     # Rendering

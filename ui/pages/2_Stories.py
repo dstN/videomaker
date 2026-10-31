@@ -38,7 +38,7 @@ if not stories:
 
 for story in stories:
     # Build expander label — show parent link for follow-ups
-    _mode_icons = {"sequel": "🔁", "prequel": "⏮", "expansion": "🔍"}
+    _mode_icons = {"sequel": "🔁", "prequel": "⏮", "expansion": "🔍", "continuation": "➡"}
     _followup_label = ""
     if story.get("followup_mode") and story.get("parent_story_id"):
         _icon = _mode_icons.get(story["followup_mode"], "↩")

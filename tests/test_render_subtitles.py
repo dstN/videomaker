@@ -38,3 +38,29 @@ def test_unknown_language_falls_back_to_english(tmp_path):
     ass = tmp_path / "p.ass"
     _write_ass_subtitles(WORDS, ass, 2, 2, "", 12.0, 8.0, "xx")
     assert "PART 2 / 2" in ass.read_text(encoding="utf-8")
+
+
+def test_render_refuses_audio_over_video_limit(tmp_path, monkeypatch):
+    import io
+    import json
+    import wave
+
+    import pytest
+
+    from app.services import render_service
+
+    audio = tmp_path / "a.wav"
+    with wave.open(str(audio), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\x00\x00" * 8000 * 181)
+    ts = tmp_path / "t.json"
+    ts.write_text(json.dumps(WORDS))
+    bg = tmp_path / "bg"
+    bg.mkdir()
+    (bg / "b.mp4").write_bytes(b"x")
+    monkeypatch.setattr(render_service, "_pick_random", lambda d, e: bg / "b.mp4")
+
+    with pytest.raises(RuntimeError, match="over the 180s video limit"):
+        render_service.render_part(1, 1, 1, "", audio, ts, tmp_path / "o.mp4")

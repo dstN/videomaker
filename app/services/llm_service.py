@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import re
 import time
@@ -342,8 +343,8 @@ def plan_parts_locally(
 ) -> list[int]:
     """
     Choose part boundaries (exclusive end sentence indices) so each part lands
-    inside [min_words, max_words] and as close to the midpoint as possible,
-    using at most max_parts parts.
+    inside [min_words, max_words], close to the upper end of the range
+    (fewer parts per story), using at most max_parts parts.
 
     The part limit wins over the word range: a story too long for
     max_parts × max_words gets evenly stretched parts instead of extra ones.
@@ -359,8 +360,12 @@ def plan_parts_locally(
     if total <= max_words:
         return [n]
 
-    limit = min(n, max_parts) if max_parts else n
-    target = (min_words + max_words) / 2
+    # More parts than this never lower the cost (each would fall below
+    # min_words); bounding k keeps the DP at O(k · n · span) instead of O(n³).
+    useful = math.ceil(total / min_words) + 2
+    limit = min(n, max_parts or useful, useful)
+    # Aim near the upper end: fewer, longer parts (max_words is still hard).
+    target = min_words + 0.85 * (max_words - min_words)
 
     def cost(words: int) -> float:
         if min_words <= words <= max_words:
@@ -405,21 +410,24 @@ def _plan_is_usable(
     max_words: int,
     max_parts: int | None = None,
 ) -> bool:
-    """Validate an LLM split plan: contiguous, complete, part count and word range."""
+    """
+    Validate an LLM split plan: contiguous, complete, part count and word range.
+    max_words is a hard limit (it keeps videos under the Shorts length);
+    a single sentence longer than max_words is tolerated as its own part.
+    """
     n = len(word_counts)
     if not ends or ends[-1] != n or any(b <= a for a, b in zip([0] + ends, ends)):
         return False
     if max_parts and len(ends) > max_parts:
         return False
-    if max_parts and sum(word_counts) > max_parts * max_words:
-        # Too long for the range at max_parts: only the part count matters.
-        return True
-    lo, hi = int(min_words * 0.85), int(max_words * 1.15)
+    lo = int(min_words * 0.85)
     start = 0
     for idx, end in enumerate(ends):
         words = sum(word_counts[start:end])
         is_last = idx == len(ends) - 1
-        if words > hi or (words < lo and not (is_last and words >= min_words * 0.5)):
+        if words > max_words and end - start > 1:
+            return False
+        if words < lo and not (is_last and words >= min_words * 0.5):
             return False
         start = end
     return True
@@ -453,8 +461,10 @@ async def split_into_parts(
     open_ending: bool = False,
 ) -> tuple[str | None, list[dict]]:
     """
-    Split story text into at most MAX_PARTS video parts of
-    PART_MIN_WORDS..PART_MAX_WORDS words.
+    Split story text into video parts of PART_MIN_WORDS..PART_MAX_WORDS words
+    (max is hard: it keeps every video under MAX_PART_SECONDS). There is no
+    limit on the number of parts here — store_parts() turns stories with
+    more than MAX_PARTS parts into a series.
     Snippets are sliced verbatim from the input — the model only chooses cut points.
 
     open_ending=True  → last part's note describes the unresolved cliffhanger.
@@ -466,7 +476,6 @@ async def split_into_parts(
     """
     settings = get_settings()
     min_w, max_w = settings.part_min_words, settings.part_max_words
-    max_parts = settings.max_parts
 
     spans = split_sentences(text)
     if not spans:
@@ -488,9 +497,8 @@ async def split_into_parts(
         f"TASK: The story below ({lang.upper()}) is given as {n} numbered sentences, "
         "each with its word count. Decide where each short-video part ends.\n\n"
         "RULES:\n"
-        f"- Use at most {max_parts} parts. Each part should contain {min_w} to {max_w} words "
-        "in total (sum the word counts); if the story is too long for that, keep the part "
-        "limit and make the parts longer.\n"
+        f"- Each part must contain {min_w} to {max_w} words in total (sum the word counts). "
+        f"{max_w} is a hard maximum.\n"
         "- Every part except the last must end on a sentence that leaves the viewer in suspense.\n"
         "- Parts are contiguous. For each part return end_sentence = the number of its LAST sentence.\n"
         f"- end_sentence values strictly increase; the final part MUST end at sentence {n}.\n"
@@ -521,13 +529,13 @@ async def split_into_parts(
     except Exception as exc:
         logger.warning("LLM split plan failed (%s) — using local splitter.", str(exc)[:200])
 
-    if not _plan_is_usable(ends, word_counts, min_w, max_w, max_parts):
+    if not _plan_is_usable(ends, word_counts, min_w, max_w):
         if ends:
             logger.warning(
                 "LLM split plan rejected (ends=%s, %d sentences) — using local splitter.",
                 ends, n,
             )
-        ends = plan_parts_locally(word_counts, min_w, max_w, max_parts)
+        ends = plan_parts_locally(word_counts, min_w, max_w)
         notes = []
         if not open_ending:
             notes = [""] * (len(ends) - 1) + ["RESOLUTION"]
@@ -585,8 +593,8 @@ async def generate_and_split(
         f"{_make_story_seed()}\n\n"
         f"STORY REQUIREMENTS:\n{ending_rule}\n"
         f"- Length: {_STORY_LENGTH_HINT}.\n"
-        "- The story will be cut into 2-4 minute video parts, so build tension in waves:\n"
-        "  a new unsettling beat roughly every 400-600 words.\n"
+        "- The story will be cut into 1-3 minute video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 250-400 words.\n"
         "- story_title: a short evocative title (≤6 words).\n\n"
         "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
@@ -710,8 +718,8 @@ async def generate_followup(
         f"{mode_block}\n\n"
         f"{_make_story_seed()}\n\n"
         f"- Length: {_STORY_LENGTH_HINT}.\n"
-        "- The story will be cut into 2-4 minute video parts, so build tension in waves:\n"
-        "  a new unsettling beat roughly every 400-600 words.\n\n"
+        "- The story will be cut into 1-3 minute video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 250-400 words.\n\n"
         "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
 

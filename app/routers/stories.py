@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import JobStatus, RenderJob, Story, Translation, VideoPart
+from app.models import Story, Translation
 from app.schemas import (
     StoryCreate,
     StoryGeneratePreviewRequest,
@@ -16,7 +16,7 @@ from app.schemas import (
     StoryResponse,
 )
 from app.services import llm_service
-from app.tasks.pipeline_tasks import enqueue_pipeline
+from app.tasks.pipeline_tasks import enqueue_pipeline, store_parts
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/stories", tags=["stories"])
@@ -126,15 +126,8 @@ async def create_story(
         )
         db.add(translation)
         db.flush()
-        for p in sorted(payload.parts, key=lambda p: p.part_number):
-            part = VideoPart(
-                translation_id=translation.id,
-                part_number=p.part_number,
-                text_snippet=p.text_snippet,
-                cliffhanger_note=p.cliffhanger_note,
-            )
-            part.render_jobs.append(RenderJob(status=JobStatus.pending))
-            db.add(part)
+        parts = sorted(payload.parts, key=lambda p: p.part_number)
+        store_parts(db, story, translation, [p.model_dump() for p in parts])
 
     db.commit()
     db.refresh(story)
