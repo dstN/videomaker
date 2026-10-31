@@ -39,9 +39,12 @@ class Settings(BaseSettings):
     tts_retry_attempts: int = 3
     tts_retry_base_delay: float = 10.0
 
-    # Video part length (words). 160-210 words ≈ 60-90 s of narration.
-    part_min_words: int = 160
-    part_max_words: int = 210
+    # Video part length (words). Voxtral speaks ~3.1 words/s (measured on
+    # rendered parts), so 370-740 words ≈ 120-240 s of narration.
+    part_min_words: int = 370
+    part_max_words: int = 740
+    # Hard cap per story — longer stories get longer parts, not more parts.
+    max_parts: int = 6
 
     # Rendering
     ffmpeg_preset: str = "fast"

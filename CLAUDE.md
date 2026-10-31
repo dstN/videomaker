@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 **Name:** Infinity Mystery Video Factory 
-**Purpose:** A local, Dockerized (WSL2) video automation pipeline. It generates originial Reddit r/nosleep style stories (or translates existing ones), splits them semantically into 60-90 second parts with cliffhangers via Gemini API, generates local TTS, syncs subtitles, and renders final vertical videos with background assets.
+**Purpose:** A local, Dockerized (WSL2) video automation pipeline. It generates originial Reddit r/nosleep style stories (or translates existing ones), splits them semantically into 2-4 minute parts (max. 6 per story) with cliffhangers via Gemini API, generates local TTS, syncs subtitles, and renders final vertical videos with background assets.
 **Key Constraint:** Multi-language scalability (EN & DE), zero OpenAI APIs, and a hybrid hardware allocation that fits an RTX 4060 (8 GB VRAM).
 
 ---
@@ -29,7 +29,7 @@
 
 ### 3.2. Core Pipeline Flow & Hardware Allocation
 1. **Ingestion:** UI accepts a prompt for a new story or a raw text. Parts approved in the preview are stored as-is.
-2. **Generation/Splitting (CLOUD):** Gemini 3.1 Flash generates/translates the text. Splitting into parts of **160-210 words** (60-90s audio, `PART_MIN_WORDS`/`PART_MAX_WORDS`) works on numbered sentences: Gemini only returns where each part ends (JSON via `response_schema`), the snippets are sliced verbatim from the source text, and a deterministic local splitter is used if the plan is invalid. Text must never be lost or paraphrased during splitting.
+2. **Generation/Splitting (CLOUD):** Gemini 3.1 Flash generates/translates the text. Splitting into **at most 6 parts** (`MAX_PARTS`) of **370-740 words** (~120-240s audio at ~3.1 words/s, `PART_MIN_WORDS`/`PART_MAX_WORDS`; the part limit wins for very long stories) works on numbered sentences: Gemini only returns where each part ends (JSON via `response_schema`), the snippets are sliced verbatim from the source text, and a deterministic local splitter is used if the plan is invalid. Text must never be lost or paraphrased during splitting.
    * *Critical Anti-AI-Sign Rule:* Gemini MUST receive `assets/pdf/signs_of_ai_writing.pdf` as a negative constraint. It is strictly forbidden to use words like *crucial, pivotal, significant, testament, tapestry, vibrant, landscape, underscore*. Prohibited patterns: Negative parallelisms ("Not only X, but also Y"), Rule of Three (3 adjectives in a row), and ending sections with formulaic summaries.
    * The PDF is uploaded via the File API and reused for 47h. Explicit context caching (`client.caches.create`) is not used because it is unavailable on the Free Tier.
 3. **Audio Generation (Windows host GPU):** Voxtral runs on the Windows host via Vulkan (`voxtral_windows_bin/Start-VoxtralService.ps1`, port 8700). Vulkan is not usable inside WSL2 Docker; the CPU build (`Dockerfile.voxtral`) is kept as an alternative. Voices are Voxtral presets (`casual_female`, `casual_male`, `neutral_female`, `neutral_male` are used); the binary's README documents only preset voices (20 across 9 languages), no zero-shot cloning from `assets/voice/clone_sample.wav`. Numbers are spelled out in the story's language before synthesis.

@@ -24,24 +24,45 @@ def test_sentence_spans_cover_all_text_in_order():
     assert '"Is anyone out there?"' in [STORY[s:e] for s, e in spans]
 
 
-def test_local_plan_respects_word_range():
-    counts = [12, 9, 15, 20, 7, 11, 14, 18, 10, 13] * 8  # 1032 words
-    ends = plan_parts_locally(counts, 160, 210)
-    assert ends[-1] == len(counts)
-    start = 0
+def _part_sizes(counts, ends):
+    sizes, start = [], 0
     for end in ends:
-        assert 160 <= sum(counts[start:end]) <= 210
+        sizes.append(sum(counts[start:end]))
         start = end
+    return sizes
+
+
+def test_local_plan_respects_word_range():
+    counts = [12, 9, 15, 20, 7, 11, 14, 18, 10, 13] * 15  # 1935 words
+    ends = plan_parts_locally(counts, 370, 740, 6)
+    assert ends[-1] == len(counts)
+    assert all(370 <= w <= 740 for w in _part_sizes(counts, ends))
 
 
 def test_local_plan_short_text_is_single_part():
-    assert plan_parts_locally([30, 40], 160, 210) == [2]
+    assert plan_parts_locally([30, 40], 370, 740, 6) == [2]
 
 
 def test_local_plan_isolates_oversized_sentence():
     ends = plan_parts_locally([100, 500, 100, 90], 160, 210)
     assert ends[-1] == 4
     assert 2 in ends and 1 in ends  # the 500-word sentence stands alone
+
+
+def test_local_plan_part_limit_wins_for_long_stories():
+    counts = [12] * 600  # 7200 words — the longest real story has 7204
+    ends = plan_parts_locally(counts, 370, 740, 6)
+    sizes = _part_sizes(counts, ends)
+    assert len(ends) == 6
+    assert ends[-1] == len(counts)
+    assert max(sizes) - min(sizes) <= 12  # stretched evenly, not one giant part
+
+
+def test_local_plan_prefers_fewer_parts_within_range():
+    counts = [10] * 166  # 1660 words ≈ median story
+    ends = plan_parts_locally(counts, 370, 740, 6)
+    assert len(ends) == 3
+    assert all(370 <= w <= 740 for w in _part_sizes(counts, ends))
 
 
 def _long_story(sentences: int = 120) -> str:
@@ -68,12 +89,12 @@ def _patch_llm(monkeypatch, plan):
 
 
 def test_split_uses_valid_llm_plan_verbatim(monkeypatch):
-    text = _long_story(48)  # 48 sentences × 8 words = 384 words
+    text = _long_story(140)  # 140 sentences × 8 words = 1120 words
     plan = llm_service._SplitPlan(
         story_title="Eight Words",
         parts=[
-            llm_service._SplitBoundary(end_sentence=24, cliffhanger_note="a"),
-            llm_service._SplitBoundary(end_sentence=48, cliffhanger_note="RESOLUTION"),
+            llm_service._SplitBoundary(end_sentence=60, cliffhanger_note="a"),
+            llm_service._SplitBoundary(end_sentence=140, cliffhanger_note="RESOLUTION"),
         ],
     )
     _patch_llm(monkeypatch, plan)
@@ -81,13 +102,13 @@ def test_split_uses_valid_llm_plan_verbatim(monkeypatch):
     title, parts = asyncio.run(llm_service.split_into_parts(text))
 
     assert title == "Eight Words"
-    assert [p["word_count"] for p in parts] == [192, 192]
+    assert [p["word_count"] for p in parts] == [480, 640]
     assert [p["cliffhanger_note"] for p in parts] == ["a", "RESOLUTION"]
     assert " ".join(p["text_snippet"] for p in parts) == text
 
 
 def test_split_falls_back_when_plan_drops_text(monkeypatch):
-    text = _long_story(120)
+    text = _long_story(300)  # 2400 words
     # Plan stops early — the old prompt-based split silently lost text like this
     plan = llm_service._SplitPlan(
         story_title="T",
@@ -98,12 +119,28 @@ def test_split_falls_back_when_plan_drops_text(monkeypatch):
     _, parts = asyncio.run(llm_service.split_into_parts(text))
 
     assert " ".join(p["text_snippet"] for p in parts) == text
-    assert all(160 <= p["word_count"] <= 210 for p in parts)
+    assert all(370 <= p["word_count"] <= 740 for p in parts)
+    assert len(parts) <= 6
     assert parts[-1]["cliffhanger_note"] == "RESOLUTION"
 
 
+def test_split_rejects_plan_with_too_many_parts(monkeypatch):
+    text = _long_story(560)  # 4480 words
+    plan = llm_service._SplitPlan(
+        story_title="T",
+        parts=[llm_service._SplitBoundary(end_sentence=e, cliffhanger_note="x")
+               for e in range(70, 561, 70)],  # 8 parts of 560 words — in range, but too many
+    )
+    _patch_llm(monkeypatch, plan)
+
+    _, parts = asyncio.run(llm_service.split_into_parts(text))
+
+    assert len(parts) == 6
+    assert " ".join(p["text_snippet"] for p in parts) == text
+
+
 def test_split_falls_back_when_llm_errors(monkeypatch):
-    text = _long_story(120)
+    text = _long_story(300)
     _patch_llm(monkeypatch, RuntimeError("500 INTERNAL"))
 
     title, parts = asyncio.run(llm_service.split_into_parts(text, open_ending=True))

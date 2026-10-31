@@ -334,12 +334,20 @@ def split_sentences(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def plan_parts_locally(word_counts: list[int], min_words: int, max_words: int) -> list[int]:
+def plan_parts_locally(
+    word_counts: list[int],
+    min_words: int,
+    max_words: int,
+    max_parts: int | None = None,
+) -> list[int]:
     """
     Choose part boundaries (exclusive end sentence indices) so each part lands
-    inside [min_words, max_words] and as close to the midpoint as possible.
-    Dynamic programming over sentence boundaries; a single sentence longer
-    than max_words becomes its own part.
+    inside [min_words, max_words] and as close to the midpoint as possible,
+    using at most max_parts parts.
+
+    The part limit wins over the word range: a story too long for
+    max_parts × max_words gets evenly stretched parts instead of extra ones.
+    Dynamic programming over (parts used, sentence boundary).
     """
     n = len(word_counts)
     if n == 0:
@@ -347,9 +355,11 @@ def plan_parts_locally(word_counts: list[int], min_words: int, max_words: int) -
     prefix = [0]
     for wc in word_counts:
         prefix.append(prefix[-1] + wc)
-    if prefix[-1] <= max_words:
+    total = prefix[-1]
+    if total <= max_words:
         return [n]
 
+    limit = min(n, max_parts) if max_parts else n
     target = (min_words + max_words) / 2
 
     def cost(words: int) -> float:
@@ -358,34 +368,52 @@ def plan_parts_locally(word_counts: list[int], min_words: int, max_words: int) -
         outside = min_words - words if words < min_words else words - max_words
         return 1e6 + (outside ** 2) * 100
 
-    best = [float("inf")] * (n + 1)
-    prev = [0] * (n + 1)
-    best[0] = 0.0
-    for j in range(1, n + 1):
-        for i in range(j - 1, -1, -1):
-            words = prefix[j] - prefix[i]
-            if words > 2 * max_words and j - i > 1:
-                break
-            c = best[i] + cost(words)
-            if c < best[j]:
-                best[j] = c
-                prev[j] = i
+    inf = float("inf")
+    # best[k][j]: minimal cost to cover sentences [0, j) with exactly k parts
+    best = [[inf] * (n + 1) for _ in range(limit + 1)]
+    prev = [[0] * (n + 1) for _ in range(limit + 1)]
+    best[0][0] = 0.0
+    # A part never needs more than the evenly stretched worst case plus slack
+    span_cap = max(2 * max_words, 2 * total / limit)
+    for k in range(1, limit + 1):
+        for j in range(1, n + 1):
+            for i in range(j - 1, k - 2, -1):
+                words = prefix[j] - prefix[i]
+                if words > span_cap and j - i > 1:
+                    break
+                if best[k - 1][i] == inf:
+                    continue
+                c = best[k - 1][i] + cost(words)
+                if c < best[k][j]:
+                    best[k][j] = c
+                    prev[k][j] = i
 
+    k = min(range(1, limit + 1), key=lambda kk: best[kk][n])
     ends: list[int] = []
     j = n
-    while j > 0:
+    while k > 0:
         ends.append(j)
-        j = prev[j]
+        j = prev[k][j]
+        k -= 1
     return list(reversed(ends))
 
 
 def _plan_is_usable(
-    ends: list[int], word_counts: list[int], min_words: int, max_words: int
+    ends: list[int],
+    word_counts: list[int],
+    min_words: int,
+    max_words: int,
+    max_parts: int | None = None,
 ) -> bool:
-    """Validate an LLM split plan: contiguous, complete, word counts in range."""
+    """Validate an LLM split plan: contiguous, complete, part count and word range."""
     n = len(word_counts)
     if not ends or ends[-1] != n or any(b <= a for a, b in zip([0] + ends, ends)):
         return False
+    if max_parts and len(ends) > max_parts:
+        return False
+    if max_parts and sum(word_counts) > max_parts * max_words:
+        # Too long for the range at max_parts: only the part count matters.
+        return True
     lo, hi = int(min_words * 0.85), int(max_words * 1.15)
     start = 0
     for idx, end in enumerate(ends):
@@ -425,7 +453,8 @@ async def split_into_parts(
     open_ending: bool = False,
 ) -> tuple[str | None, list[dict]]:
     """
-    Split story text into video parts of PART_MIN_WORDS..PART_MAX_WORDS words.
+    Split story text into at most MAX_PARTS video parts of
+    PART_MIN_WORDS..PART_MAX_WORDS words.
     Snippets are sliced verbatim from the input — the model only chooses cut points.
 
     open_ending=True  → last part's note describes the unresolved cliffhanger.
@@ -437,6 +466,7 @@ async def split_into_parts(
     """
     settings = get_settings()
     min_w, max_w = settings.part_min_words, settings.part_max_words
+    max_parts = settings.max_parts
 
     spans = split_sentences(text)
     if not spans:
@@ -458,7 +488,9 @@ async def split_into_parts(
         f"TASK: The story below ({lang.upper()}) is given as {n} numbered sentences, "
         "each with its word count. Decide where each short-video part ends.\n\n"
         "RULES:\n"
-        f"- Each part must contain {min_w} to {max_w} words in total (sum the word counts).\n"
+        f"- Use at most {max_parts} parts. Each part should contain {min_w} to {max_w} words "
+        "in total (sum the word counts); if the story is too long for that, keep the part "
+        "limit and make the parts longer.\n"
         "- Every part except the last must end on a sentence that leaves the viewer in suspense.\n"
         "- Parts are contiguous. For each part return end_sentence = the number of its LAST sentence.\n"
         f"- end_sentence values strictly increase; the final part MUST end at sentence {n}.\n"
@@ -489,13 +521,13 @@ async def split_into_parts(
     except Exception as exc:
         logger.warning("LLM split plan failed (%s) — using local splitter.", str(exc)[:200])
 
-    if not _plan_is_usable(ends, word_counts, min_w, max_w):
+    if not _plan_is_usable(ends, word_counts, min_w, max_w, max_parts):
         if ends:
             logger.warning(
                 "LLM split plan rejected (ends=%s, %d sentences) — using local splitter.",
                 ends, n,
             )
-        ends = plan_parts_locally(word_counts, min_w, max_w)
+        ends = plan_parts_locally(word_counts, min_w, max_w, max_parts)
         notes = []
         if not open_ending:
             notes = [""] * (len(ends) - 1) + ["RESOLUTION"]
@@ -553,8 +585,8 @@ async def generate_and_split(
         f"{_make_story_seed()}\n\n"
         f"STORY REQUIREMENTS:\n{ending_rule}\n"
         f"- Length: {_STORY_LENGTH_HINT}.\n"
-        "- The story will be cut into ~60-90 second video parts, so build tension in waves:\n"
-        "  a new unsettling beat roughly every 150-200 words.\n"
+        "- The story will be cut into 2-4 minute video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 400-600 words.\n"
         "- story_title: a short evocative title (≤6 words).\n\n"
         "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
@@ -678,8 +710,8 @@ async def generate_followup(
         f"{mode_block}\n\n"
         f"{_make_story_seed()}\n\n"
         f"- Length: {_STORY_LENGTH_HINT}.\n"
-        "- The story will be cut into ~60-90 second video parts, so build tension in waves:\n"
-        "  a new unsettling beat roughly every 150-200 words.\n\n"
+        "- The story will be cut into 2-4 minute video parts, so build tension in waves:\n"
+        "  a new unsettling beat roughly every 400-600 words.\n\n"
         "Return the full story as plain prose in 'text' (paragraphs separated by blank lines)."
     )
 
