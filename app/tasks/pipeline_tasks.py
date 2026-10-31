@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import random
-import subprocess
+import time
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -30,9 +30,77 @@ _active_story_keys: set[str] = set()   # "story_id:lang" of stories in queue/run
 _RESUMABLE_STATUSES = {JobStatus.pending, JobStatus.audio_done, JobStatus.sync_done}
 _POLL_INTERVAL = 3  # seconds between DB scans
 
+# Backoff for stories whose preparation (translate/split via Gemini) keeps
+# failing — without it the poller would re-hit Gemini every _POLL_INTERVAL.
+_PREPARE_RETRY_BASE_DELAY = 60     # seconds after the first failure
+_PREPARE_RETRY_MAX_DELAY = 3600    # cap for the exponential backoff
+_prepare_failures: dict[str, tuple[int, float]] = {}  # key -> (failures, next attempt monotonic)
+
 
 def _story_key(story_id: int, language_code: str) -> str:
     return f"{story_id}:{language_code}"
+
+
+def _resume_status(part: VideoPart) -> JobStatus:
+    """Furthest status a job can resume from, based on artefacts on disk."""
+    if part.timestamps_path and Path(part.timestamps_path).exists():
+        return JobStatus.sync_done
+    if part.audio_path and Path(part.audio_path).exists():
+        return JobStatus.audio_done
+    return JobStatus.pending
+
+
+def _in_prepare_backoff(key: str) -> bool:
+    entry = _prepare_failures.get(key)
+    return entry is not None and time.monotonic() < entry[1]
+
+
+def _record_prepare_result(story_id: int, language_code: str) -> None:
+    """After a pipeline run: back off if the story still has no parts, else clear."""
+    key = _story_key(story_id, language_code)
+    db: Session = SessionLocal()
+    try:
+        has_parts = (
+            db.query(VideoPart.id)
+            .join(Translation, Translation.id == VideoPart.translation_id)
+            .filter(
+                Translation.story_id == story_id,
+                Translation.language_code == language_code,
+            )
+            .first()
+            is not None
+        )
+    finally:
+        db.close()
+
+    if has_parts:
+        _prepare_failures.pop(key, None)
+        return
+
+    failures = _prepare_failures.get(key, (0, 0.0))[0] + 1
+    delay = min(_PREPARE_RETRY_BASE_DELAY * 2 ** (failures - 1), _PREPARE_RETRY_MAX_DELAY)
+    _prepare_failures[key] = (failures, time.monotonic() + delay)
+    logger.warning(
+        "Story %d/%s still has no parts after %d attempt(s) — next try in %ds.",
+        story_id, language_code, failures, delay,
+    )
+
+
+def reset_interrupted_jobs() -> int:
+    """
+    Reset jobs left in 'rendering' by a crash/restart to their resume point.
+    Must run before the worker starts — at that moment nothing is rendering.
+    """
+    db: Session = SessionLocal()
+    try:
+        jobs = db.query(RenderJob).filter(RenderJob.status == JobStatus.rendering).all()
+        for job in jobs:
+            job.status = _resume_status(job.video_part)
+            logger.info("Reset interrupted job %d → %s", job.id, job.status)
+        db.commit()
+        return len(jobs)
+    finally:
+        db.close()
 
 
 async def enqueue_pipeline(story_id: int, language_code: str) -> bool:
@@ -66,12 +134,7 @@ async def enqueue_retry(job_id: int) -> bool:
         lang = part.translation.language_code
 
         # Reset this job to the furthest resumable point
-        if part.timestamps_path and Path(part.timestamps_path).exists():
-            job.status = JobStatus.sync_done
-        elif part.audio_path and Path(part.audio_path).exists():
-            job.status = JobStatus.audio_done
-        else:
-            job.status = JobStatus.pending
+        job.status = _resume_status(part)
         job.error_message = None
         db.commit()
         logger.info("Reset job %d → %s (story=%d/%s)", job_id, job.status, story_id, lang)
@@ -122,7 +185,11 @@ def _find_stories_with_pending_jobs() -> list[tuple[int, str]]:
     """
     Return (story_id, lang) pairs that need processing:
     - Stories with RenderJobs in a resumable state, OR
+    - Translations that were never split into parts (split failed), OR
     - Stories that have no Translation at all yet (never started)
+
+    Translations whose Story was deleted are ignored — SQLite does not enforce
+    the FK, so such orphans would otherwise be re-enqueued forever.
     """
     db: Session = SessionLocal()
     try:
@@ -131,6 +198,7 @@ def _find_stories_with_pending_jobs() -> list[tuple[int, str]]:
         # 1. Stories with existing but unfinished jobs
         rows = (
             db.query(Translation.story_id, Translation.language_code)
+            .join(Story, Story.id == Translation.story_id)
             .join(VideoPart, VideoPart.translation_id == Translation.id)
             .join(RenderJob, RenderJob.video_part_id == VideoPart.id)
             .filter(RenderJob.status.in_(_RESUMABLE_STATUSES))
@@ -140,7 +208,17 @@ def _find_stories_with_pending_jobs() -> list[tuple[int, str]]:
         )
         results.extend((r.story_id, r.language_code) for r in rows)
 
-        # 2. Stories that have no Translation at all (pipeline never started)
+        # 2. Translations without any VideoPart (splitting never succeeded)
+        unsplit = (
+            db.query(Translation.story_id, Translation.language_code)
+            .join(Story, Story.id == Translation.story_id)
+            .filter(~Translation.video_parts.any())
+            .order_by(Translation.story_id)
+            .all()
+        )
+        results.extend((r.story_id, r.language_code) for r in unsplit)
+
+        # 3. Stories that have no Translation at all (pipeline never started)
         seen_story_ids = {r[0] for r in results}
         untranslated = (
             db.query(Story)
@@ -167,7 +245,7 @@ async def _poll_pending_jobs() -> None:
         try:
             for story_id, lang in _find_stories_with_pending_jobs():
                 key = _story_key(story_id, lang)
-                if key not in _active_story_keys:
+                if key not in _active_story_keys and not _in_prepare_backoff(key):
                     logger.info("Poller: found pending story %d/%s — auto-enqueuing.", story_id, lang)
                     _active_story_keys.add(key)
                     await _pipeline_queue.put(("pipeline", story_id, lang))
@@ -182,6 +260,9 @@ async def pipeline_worker() -> None:
     Spawns the background poller on startup.
     """
     logger.info("Pipeline worker started — sequential job processing active.")
+    reset = reset_interrupted_jobs()
+    if reset:
+        logger.info("Recovered %d job(s) interrupted mid-render.", reset)
     asyncio.create_task(_poll_pending_jobs())
     while True:
         item = await _pipeline_queue.get()
@@ -193,6 +274,10 @@ async def pipeline_worker() -> None:
         except Exception:
             logger.exception("Pipeline worker caught unhandled exception — continuing.")
         finally:
+            try:
+                _record_prepare_result(story_id, language_code)
+            except Exception:
+                logger.exception("Could not record prepare result for %s.", key)
             _active_story_keys.discard(key)
             _pipeline_queue.task_done()
 
@@ -371,13 +456,7 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
                     "Part %d previously failed — retrying from last good status.",
                     part.part_number,
                 )
-                # Determine resume point based on stored paths
-                if part.timestamps_path and Path(part.timestamps_path).exists():
-                    job.status = JobStatus.sync_done
-                elif part.audio_path and Path(part.audio_path).exists():
-                    job.status = JobStatus.audio_done
-                else:
-                    job.status = JobStatus.pending
+                job.status = _resume_status(part)
                 job.error_message = None
                 db.commit()
 
@@ -457,7 +536,9 @@ async def run_pipeline(story_id: int, language_code: str) -> None:
                     logger.info(
                         "Part %d rendered → %s", part.part_number, rendered_path
                     )
-                except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                except Exception as exc:
+                    # Catch everything: an uncaught error here would leave the
+                    # job stuck in 'rendering', which the poller never resumes.
                     logger.error(
                         "Render failed for part %d: %s", part.part_number, exc
                     )
@@ -521,12 +602,7 @@ async def retry_job(job_id: int) -> None:
         translation: Translation = part.translation
 
         # Reset status based on available artifacts
-        if part.timestamps_path and Path(part.timestamps_path).exists():
-            job.status = JobStatus.sync_done
-        elif part.audio_path and Path(part.audio_path).exists():
-            job.status = JobStatus.audio_done
-        else:
-            job.status = JobStatus.pending
+        job.status = _resume_status(part)
         job.error_message = None
         db.commit()
 
