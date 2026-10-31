@@ -14,8 +14,15 @@ SUPPORTED_LANGUAGES = {
 st.set_page_config(page_title="Stories", page_icon="📚", layout="wide")
 st.title("📚 Stories")
 
+PAGE_SIZE = 25
+page = st.number_input("Seite", min_value=1, value=1, step=1)
+
 try:
-    resp = requests.get(f"{API_BASE}/stories/", timeout=10)
+    resp = requests.get(
+        f"{API_BASE}/stories/",
+        params={"limit": PAGE_SIZE, "offset": (page - 1) * PAGE_SIZE},
+        timeout=10,
+    )
     resp.raise_for_status()
     stories = resp.json()
 except requests.exceptions.ConnectionError:
@@ -26,7 +33,7 @@ except Exception as e:
     st.stop()
 
 if not stories:
-    st.info("No stories yet. Go to **Ingest** to add one.")
+    st.info("No stories on this page. Go to **Ingest** to add one.")
     st.stop()
 
 for story in stories:

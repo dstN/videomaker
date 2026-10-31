@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -148,8 +148,18 @@ async def create_story(
 
 
 @router.get("/", response_model=list[StoryResponse])
-def list_stories(db: Session = Depends(get_db)) -> list[Story]:
-    return db.query(Story).order_by(Story.created_at.desc()).all()
+def list_stories(
+    limit: int = Query(25, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[Story]:
+    return (
+        db.query(Story)
+        .order_by(Story.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
 
 @router.get("/{story_id}", response_model=StoryResponse)

@@ -155,41 +155,38 @@ async def enqueue_retry(job_id: int) -> bool:
     return await enqueue_pipeline(story_id, lang)
 
 
-async def retry_all_stories() -> int:
+async def retry_failed_jobs() -> int:
     """
-    Reset ALL translations (TTS + sync + render artefacts) and re-queue every
-    story:lang pair. Returns the number of pairs successfully enqueued.
+    Reset every failed job of an existing story to its resume point and
+    re-queue the affected story:lang pairs. Keeps all artefacts on disk —
+    finished/exported parts are never touched. Returns pairs enqueued.
     """
-    settings = get_settings()
     db: Session = SessionLocal()
-    queued = 0
+    keys: set[tuple[int, str]] = set()
     try:
-        translations = db.query(Translation).all()
-        for tr in translations:
-            story_id = tr.story_id
-            lang = tr.language_code
-            for part in tr.video_parts:
-                if part.audio_path:
-                    Path(part.audio_path).unlink(missing_ok=True)
-                    part.audio_path = None
-                if part.timestamps_path:
-                    Path(part.timestamps_path).unlink(missing_ok=True)
-                    part.timestamps_path = None
-                for job in part.render_jobs:
-                    if job.file_path:
-                        Path(job.file_path).unlink(missing_ok=True)
-                        job.file_path = None
-                    job.status = JobStatus.pending
-                    job.error_message = None
-            db.commit()
-            # Remove the .done sentinel so the story can be re-exported
-            (settings.output_dir / lang / str(story_id) / ".done").unlink(missing_ok=True)
-            if await enqueue_pipeline(story_id, lang):
-                queued += 1
-        logger.info("retry_all_stories: %d story:lang pairs enqueued", queued)
-        return queued
+        jobs = (
+            db.query(RenderJob)
+            .join(VideoPart, VideoPart.id == RenderJob.video_part_id)
+            .join(Translation, Translation.id == VideoPart.translation_id)
+            .join(Story, Story.id == Translation.story_id)
+            .filter(RenderJob.status == JobStatus.failed)
+            .all()
+        )
+        for job in jobs:
+            job.status = _resume_status(job.video_part)
+            job.error_message = None
+            tr = job.video_part.translation
+            keys.add((tr.story_id, tr.language_code))
+        db.commit()
     finally:
         db.close()
+
+    queued = 0
+    for story_id, lang in sorted(keys):
+        if await enqueue_pipeline(story_id, lang):
+            queued += 1
+    logger.info("retry_failed_jobs: %d job(s) reset, %d story:lang pairs enqueued", len(jobs), queued)
+    return queued
 
 
 def _find_stories_with_pending_jobs() -> list[tuple[int, str]]:

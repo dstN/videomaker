@@ -2,28 +2,35 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import RenderJob, VideoPart, Translation, Story
+from app.models import JobStatus, RenderJob, VideoPart, Translation, Story
 from app.schemas import RenderJobList, RenderJobResponse
-from app.tasks.pipeline_tasks import enqueue_retry, retry_all_stories
+from app.tasks.pipeline_tasks import enqueue_retry, retry_failed_jobs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 @router.get("/", response_model=RenderJobList)
-def list_jobs(db: Session = Depends(get_db)) -> RenderJobList:
-    rows = (
+def list_jobs(
+    status: JobStatus | None = None,
+    limit: int = Query(200, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> RenderJobList:
+    query = (
         db.query(RenderJob, VideoPart, Translation, Story)
         .join(VideoPart, VideoPart.id == RenderJob.video_part_id)
         .join(Translation, Translation.id == VideoPart.translation_id)
         .join(Story, Story.id == Translation.story_id)
-        .order_by(RenderJob.updated_at.desc())
-        .all()
     )
+    if status is not None:
+        query = query.filter(RenderJob.status == status)
+    total = query.count()
+    rows = query.order_by(RenderJob.updated_at.desc()).offset(offset).limit(limit).all()
     result = []
     for job, part, translation, story in rows:
         item = RenderJobResponse(
@@ -38,7 +45,7 @@ def list_jobs(db: Session = Depends(get_db)) -> RenderJobList:
             updated_at=job.updated_at,
         )
         result.append(item)
-    return RenderJobList(jobs=result, total=len(result))
+    return RenderJobList(jobs=result, total=total)
 
 
 @router.get("/{job_id}", response_model=RenderJobResponse)
@@ -66,9 +73,9 @@ async def retry_render_job(
     return job
 
 
-@router.post("/retry-all")
-async def retry_all_jobs() -> dict:
-    """Reset all artefacts and re-queue every story for a full pipeline run."""
-    queued = await retry_all_stories()
-    logger.info("retry-all: %d story:lang pairs enqueued", queued)
+@router.post("/retry-failed")
+async def retry_failed() -> dict:
+    """Re-queue every failed job from its last good step. Deletes nothing."""
+    queued = await retry_failed_jobs()
+    logger.info("retry-failed: %d story:lang pairs enqueued", queued)
     return {"queued": queued}

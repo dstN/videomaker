@@ -122,3 +122,48 @@ def test_reset_interrupted_jobs_resumes_from_artefacts(db, tmp_dir):
     assert db.get(RenderJob, job_audio.id).status == JobStatus.audio_done
     assert db.get(RenderJob, job_none.id).status == JobStatus.pending
     assert db.get(RenderJob, job_done.id).status == JobStatus.completed
+
+
+def test_retry_failed_jobs_resets_only_failed_and_keeps_files(db, tmp_dir, monkeypatch):
+    enqueued = []
+
+    async def fake_enqueue(story_id, lang):
+        enqueued.append((story_id, lang))
+        return True
+
+    monkeypatch.setattr(pipeline_tasks, "enqueue_pipeline", fake_enqueue)
+
+    audio = tmp_dir / "kept.wav"
+    audio.write_bytes(b"RIFF")
+    video = tmp_dir / "kept.mp4"
+    video.write_bytes(b"mp4")
+
+    tr_failed = _story_with_translation(db)
+    failed = _add_part(db, tr_failed, JobStatus.failed, audio_path=str(audio))
+    tr_done = _story_with_translation(db)
+    done = _add_part(db, tr_done, JobStatus.completed)
+    done.file_path = str(video)
+    db.commit()
+
+    import asyncio
+    assert asyncio.run(pipeline_tasks.retry_failed_jobs()) == 1
+
+    db.expire_all()
+    assert db.get(RenderJob, failed.id).status == JobStatus.audio_done
+    assert db.get(RenderJob, done.id).status == JobStatus.completed
+    assert audio.exists() and video.exists()
+    assert enqueued == [(tr_failed.story_id, "en")]
+
+
+def test_list_jobs_filters_and_counts(db):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    for status in (JobStatus.failed, JobStatus.failed, JobStatus.completed):
+        _add_part(db, _story_with_translation(db), status)
+
+    client = TestClient(app)
+    data = client.get("/jobs/", params={"status": "failed", "limit": 1}).json()
+    assert data["total"] == 2
+    assert len(data["jobs"]) == 1
+    assert data["jobs"][0]["status"] == "failed"

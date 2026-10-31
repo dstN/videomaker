@@ -19,20 +19,31 @@ STATUS_COLORS = {
 st.set_page_config(page_title="Render Queue", page_icon="🎬", layout="wide")
 st.title("🎬 Render Queue")
 
-auto_refresh = st.toggle("Auto-refresh (every 3s)", value=True)
+col_toggle, col_status, col_limit = st.columns([2, 2, 1])
+with col_toggle:
+    auto_refresh = st.toggle("Auto-refresh (every 3s)", value=True)
+with col_status:
+    status_filter = st.selectbox("Status", options=["alle"] + list(STATUS_COLORS), index=0)
+with col_limit:
+    limit = st.number_input("Anzahl", min_value=10, max_value=2000, value=100, step=50)
 refresh_placeholder = st.empty()
 
-def fetch_jobs() -> list:
+
+def fetch_jobs() -> tuple[list, int]:
+    params = {"limit": int(limit)}
+    if status_filter != "alle":
+        params["status"] = status_filter
     try:
-        resp = requests.get(f"{API_BASE}/jobs/", timeout=10)
+        resp = requests.get(f"{API_BASE}/jobs/", params=params, timeout=10)
         resp.raise_for_status()
-        return resp.json().get("jobs", [])
+        data = resp.json()
+        return data.get("jobs", []), data.get("total", 0)
     except requests.exceptions.ConnectionError:
         st.error("❌ Cannot connect to API.")
-        return []
+        return [], 0
     except Exception as e:
         st.error(f"❌ Error fetching jobs: {e}")
-        return []
+        return [], 0
 
 
 def retry_job(job_id: int) -> None:
@@ -44,11 +55,12 @@ def retry_job(job_id: int) -> None:
         st.error(f"Retry failed: {e}")
 
 
-def render_queue(jobs: list) -> None:
+def render_queue(jobs: list, total: int) -> None:
     if not jobs:
         st.info("No render jobs found.")
         return
 
+    st.caption(f"{len(jobs)} von {total} Jobs")
     cols = st.columns([1, 3, 1, 2, 3, 2, 1])
     cols[0].markdown("**Job**")
     cols[1].markdown("**Story**")
@@ -80,21 +92,20 @@ def render_queue(jobs: list) -> None:
         updated = (job.get("updated_at") or "")[:19].replace("T", " ")
         cols[5].write(updated)
 
-        if job["status"] in ("failed", "completed"):
+        # Only failed jobs: completed ones are usually exported to Drive and
+        # deleted locally, so a retry would re-render and re-export them.
+        if job["status"] == "failed":
             if cols[6].button("↩ Retry", key=f"retry_{job['id']}"):
                 retry_job(job["id"])
         else:
             cols[6].write("")
 
 
-# ── Retry-all ─────────────────────────────────────────────────────────────────
+# ── Retry failed ──────────────────────────────────────────────────────────────
 st.markdown("---")
-confirm_retry_all = st.checkbox(
-    "✅ Ja, ich will ALLE Stories neu rendern (TTS + Sync + Render)"
-)
-if st.button("🔄 Alle neu rendern", disabled=not confirm_retry_all, type="primary"):
+if st.button("🔄 Alle fehlgeschlagenen Jobs erneut versuchen", type="primary"):
     try:
-        r = requests.post(f"{API_BASE}/jobs/retry-all", timeout=30)
+        r = requests.post(f"{API_BASE}/jobs/retry-failed", timeout=30)
         r.raise_for_status()
         st.success(f"✓ {r.json()['queued']} Stories in die Queue gestellt.")
     except Exception as e:
@@ -103,9 +114,9 @@ st.markdown("---")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
-    jobs = fetch_jobs()
+    jobs, total = fetch_jobs()
     with refresh_placeholder.container():
-        render_queue(jobs)
+        render_queue(jobs, total)
 
     if not auto_refresh:
         break
