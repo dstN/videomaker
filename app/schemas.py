@@ -9,14 +9,24 @@ from app.models import JobStatus
 
 # ── Story ─────────────────────────────────────────────────────────────────────
 
+class PartIn(BaseModel):
+    part_number: int
+    text_snippet: str = Field(..., min_length=1)
+    cliffhanger_note: str = ""
+
+
 class StoryCreate(BaseModel):
-    original_text_en: str = Field(..., min_length=100)
+    original_text_en: str = Field(..., min_length=100, description="Story text in source_language")
+    source_language: str = Field(default="en", description="Language original_text_en is written in")
     title: str | None = None
     source_url: str | None = None
     languages: list[str] = Field(default=["en"], description="Language codes to process, e.g. ['en', 'de']")
     parent_story_id: int | None = None
     followup_mode: str | None = None  # 'sequel' | 'prequel' | 'expansion'
     open_ending: bool = False
+    # Parts approved in the preview. Stored as-is for source_language so the
+    # rendered videos match what was reviewed (no second Gemini split).
+    parts: list[PartIn] | None = None
 
 
 class StoryGeneratePreviewRequest(BaseModel):
@@ -53,6 +63,7 @@ class StoryResponse(BaseModel):
     id: int
     title: str | None
     original_text_en: str
+    source_language: str = "en"
     source_url: str | None
     parent_story_id: int | None = None
     followup_mode: str | None = None

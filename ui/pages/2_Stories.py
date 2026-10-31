@@ -47,7 +47,7 @@ for story in stories:
         expanded=False,
     ):
         st.text_area(
-            "Original Text (EN)",
+            f"Original Text ({story.get('source_language', 'en').upper()})",
             value=story["original_text_en"][:500] + ("..." if len(story["original_text_en"]) > 500 else ""),
             height=100,
             disabled=True,
@@ -180,6 +180,8 @@ for story in stories:
             if st.button("✅ Sequel an Render-Queue senden", key=f"submit_seq_{story['id']}"):
                 payload = {
                     "original_text_en": preview["assembled_text"],
+                    "source_language": lang_code,
+                    "parts": preview["parts"],
                     "title": preview.get("title") or None,
                     "source_url": None,
                     "languages": [lang_code],

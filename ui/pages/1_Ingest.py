@@ -90,6 +90,8 @@ if "preview" in st.session_state:
     if st.button("An Render-Queue senden", type="primary"):
         payload = {
             "original_text_en": preview["assembled_text"],
+            "source_language": lang_code,
+            "parts": preview["parts"],
             "title": preview.get("title") or None,
             "source_url": None,
             "languages": [lang_code],
@@ -107,7 +109,7 @@ if "preview" in st.session_state:
                 story_id = data["id"]
                 st.success(f"Story #{story_id} ist in der Queue!")
                 st.info(
-                    "Voxtral TTS -> WhisperX -> MoviePy laeuft im Hintergrund. "
+                    "Voxtral TTS -> WhisperX -> ffmpeg laeuft im Hintergrund. "
                     "Fortschritt auf der Render Queue-Seite verfolgen."
                 )
                 del st.session_state["preview"]

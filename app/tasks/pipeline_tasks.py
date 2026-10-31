@@ -340,7 +340,7 @@ async def prepare_story_parts(story_id: int, language_code: str) -> None:
         if translation is None:
             logger.info("Translating story %d → %s", story_id, language_code)
             translated_text = await llm_service.translate_text(
-                story.original_text_en, language_code
+                story.original_text_en, language_code, source_lang=story.source_language or "en"
             )
             translation = Translation(
                 story_id=story_id,

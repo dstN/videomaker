@@ -41,7 +41,12 @@ class Story(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
     voice: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Source text of the story. Despite the legacy name it is written in
+    # source_language (stories generated in German are stored in German).
     original_text_en: Mapped[str] = mapped_column(Text, nullable=False)
+    source_language: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="en", server_default="en"
+    )
     source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Follow-up tracking: set when this story was generated from another
     parent_story_id: Mapped[int | None] = mapped_column(
