@@ -1,18 +1,18 @@
 # Project Status & Handoff
 
-Last updated: 2026-10-31. Read this together with `CLAUDE.md` at the start of a session.
+Last updated: 2026-11-01. Read this together with `CLAUDE.md` at the start of a session.
 
 ## 1. Where things stand
 
 | Branch | Content | State |
 |---|---|---|
-| `master` | Original code as found on 2026-10-31 (initial commit) | Live in the running containers |
-| `fix/pipeline-stuck-states` | Poller/recovery fixes (first 2 commits) | Contained in `fix/review-findings` |
-| `fix/review-findings` | All review fixes + Claude integration + recaps (15 commits) | Pushed, **not merged, no PR** (user asked for no PR yet) |
+| `master` | All review fixes + Claude integration + recaps (`fix/review-findings` fast-forward merged on 2026-11-01) | Current |
+| `backup/master-pre-merge` | Original code as found on 2026-10-31 (initial commit `19e999a`) | Rollback point |
+| `fix/review-findings`, `fix/pipeline-stuck-states` | Merged into `master` | Can be deleted |
 
 Repo: private `github.com/dstN/videomaker`. Commits never carry a `Co-Authored-By` trailer (user rule).
 
-`./app` is bind-mounted into the `api` container: checking out `fix/review-findings` changes the code the running API loads. Keep the working tree on `master` until the user merges.
+Rollback: `git checkout backup/master-pre-merge && docker compose build api ui whisperx && docker compose up -d`. `./app` is bind-mounted into the `api` container, so the checked-out branch is the code the API runs; the images must match its `requirements.txt`. The DB schema only gained columns, so the old code still runs against it.
 
 ## 2. Product decisions (from the user — do not change without asking)
 
@@ -26,9 +26,9 @@ Repo: private `github.com/dstN/videomaker`. Commits never carry a `Co-Authored-B
 
 ## 3. What the user still has to run (in this order)
 
-1. Merge `fix/review-findings`, then `docker compose build api ui whisperx && docker compose up -d`.
-   Without the rebuild the API crash-loops (`num2words`, `anthropic`, `pypdf` missing) and WhisperX keeps doing ASR.
-2. Add `ANTHROPIC_API_KEY=…` to `.env` (optional: `VOXTRAL_URL`, see `.env.example`). Host scripts need `pip install anthropic pypdf num2words`.
+1. ~~Merge, rebuild images, install host deps~~ — done 2026-11-01 (`docker compose build api ui whisperx`; host `pip install --user anthropic pypdf num2words`). Containers are stopped on purpose: do steps 2-4 before `docker compose up -d`, otherwise the poller starts rendering the old over-long splits.
+   `whisperx` is pinned to 3.3.1 in `requirements.whisperx.txt` (newer releases need torch ≥ 2.5 / cuDNN 9; unpinned, pip backtracked through all releases and ran WSL out of RAM).
+2. Add `ANTHROPIC_API_KEY=…` to `.env` (optional: `VOXTRAL_URL`, see `.env.example`), then `docker compose up -d api`.
 3. `python cleanup_orphan_rows.py` → `--apply` (199 translations / 447 parts / 1745 jobs without a story).
 4. `python resplit_unstarted_stories.py` → `--apply` (335 unstarted stories still have the old Gemini split; their parts would now fail the 180 s check).
 5. Render **one** story end to end and check it before letting the queue run.
@@ -39,8 +39,9 @@ All scripts are dry runs unless `--apply` is passed. None of them was run agains
 ## 4. Not verified live (only mocked / offline)
 
 - Claude API calls (no key in the session), Gemini split plans, recap generation.
-- WhisperX forced alignment on the GPU (single segment up to ~3 min; falls back to ASR on errors).
 - Voxtral retries, `_fit_duration` speed-up, nvenc rendering of the new limits.
+
+Verified live 2026-11-01: WhisperX forced alignment on the RTX 4060 (story 124 part 1, 132 s WAV: 415/415 script words aligned, 37 s incl. align-model load).
 
 Offline evidence: 70 pytest tests (`pytest`, see `requirements-dev.txt`); the local splitter was run over all 516 stories (no text loss, parts 238-440 words, 419 single stories / 94 two-part / 3 three-part series).
 

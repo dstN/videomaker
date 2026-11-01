@@ -1,4 +1,8 @@
-whisperx>=3.1.5
+# Pinned: whisperx>=3.4 needs torch>=2.5.1 + transformers>=4.48; unpinned, pip backtracks
+# through every release downloading torch builds and runs WSL out of RAM.
+# ctranslate2>=4.5 needs cuDNN 9, the base image ships cuDNN 8.
+whisperx==3.3.1
+ctranslate2==4.4.0
 # transformers>=4.41 hat NameError: 'torch' nicht definiert in pipelines/base.py:get_inference_context()
 # whisperx ist kompatibel mit 4.40.x
 transformers==4.40.2
